@@ -1,0 +1,109 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DID.Document where
+
+import DA.Text as T
+import DA.Set (Set)
+import qualified DA.Set as Set
+
+-- | Represents a W3C-compatible Verification Method. This data type is used to
+-- | express cryptographic material, such as public keys, that can be used to
+-- | authenticate or authorize interactions with the DID subject.
+-- | See: https://www.w3.org/TR/did-core/#verification-methods
+data VerificationMethod = VerificationMethod with
+  id: Text                 -- ^ A DID URL identifying the verification method, e.g., "did:example:123#keys-1".
+  methodType: Text         -- ^ The type of the verification method, e.g., "Ed25519VerificationKey2020".
+  controller: Text         -- ^ The DID that controls this verification method.
+  publicKeyMultibase: Text -- ^ The public key, encoded in IETF RFC 4648 multibase format.
+  deriving (Eq, Show)
+
+-- | Represents a W3C-compatible Service Endpoint. Services are used to express
+-- | ways of communicating with the DID subject, such as a repository for
+-- | verifiable credentials.
+-- | See: https://www.w3.org/TR/did-core/#services
+data Service = Service with
+  id: Text                 -- ^ A DID URL identifying the service, e.g., "did:example:123#vcs".
+  serviceType: Text        -- ^ The type of the service, e.g., "VerifiableCredentialRepository".
+  serviceEndpoint: Text    -- ^ The URI of the service endpoint.
+  deriving (Eq, Show)
+
+-- | Helper function to check if a list of reference IDs are all present in the master set of method IDs.
+allReferencesAreValid : Set Text -> [Text] -> Bool
+allReferencesAreValid methodIds refs =
+  all (\ref -> Set.member ref methodIds) refs
+
+-- | Helper function to check optional lists of reference IDs against the master set of method IDs.
+optionalReferencesAreValid : Set Text -> Optional [Text] -> Bool
+optionalReferencesAreValid methodIds optRefs =
+  case optRefs of
+    None -> True
+    Some refs -> allReferencesAreValid methodIds refs
+
+-- | Represents a W3C-compatible Decentralized Identifier (DID) Document on the Canton ledger.
+-- This template stores the core components of a DID, such as verification methods and services,
+-- enabling on-ledger resolution and management of DIDs. It serves as the root of trust for
+-- any verifiable credentials issued by this DID.
+template DIDDocument
+  with
+    did: Text                     -- ^ The DID URI string (e.g., "did:canton:123..."). This is the unique identifier.
+    ledgerController: Party       -- ^ The Daml party who has control over this DID Document contract on the ledger.
+    alsoKnownAs: Optional [Text]  -- ^ Optional list of other URIs for the DID subject.
+    verificationMethod: [VerificationMethod] -- ^ List of cryptographic keys and other verification methods.
+    authentication: [Text]        -- ^ Method IDs from `verificationMethod` used for authentication.
+    assertionMethod: [Text]       -- ^ Method IDs from `verificationMethod` used for asserting claims (e.g., signing VCs).
+    keyAgreement: Optional [Text] -- ^ Method IDs used for key agreement (encryption).
+    capabilityInvocation: Optional [Text] -- ^ Method IDs used for invoking capabilities.
+    capabilityDelegation: Optional [Text] -- ^ Method IDs used for delegating capabilities.
+    service: Optional [Service]   -- ^ List of service endpoints associated with the DID.
+
+  where
+    signatory ledgerController
+
+    unique key did : Text
+
+    ensure
+      let
+        -- Create a Set of all verification method IDs for efficient lookup.
+        methodIdSet = Set.fromList $ map (\vm -> vm.id) verificationMethod
+      in
+        -- The DID must conform to the basic "did:" prefix format.
+        T.isPrefixOf "did:" did &&
+          -- All verification relationship references must point to a valid verification method.
+          allReferencesAreValid methodIdSet authentication &&
+          allReferencesAreValid methodIdSet assertionMethod &&
+          optionalReferencesAreValid methodIdSet keyAgreement &&
+          optionalReferencesAreValid methodIdSet capabilityInvocation &&
+          optionalReferencesAreValid methodIdSet capabilityDelegation
+
+    -- | Updates the entire DID Document. This is a consuming choice that archives the current
+    -- | document and creates a new one with the provided data. This is the standard pattern for
+    -- | DID lifecycle events like key rotation or service endpoint updates.
+    choice Update : ContractId DIDDocument
+      with
+        newAlsoKnownAs: Optional [Text]
+        newVerificationMethod: [VerificationMethod]
+        newAuthentication: [Text]
+        newAssertionMethod: [Text]
+        newKeyAgreement: Optional [Text]
+        newCapabilityInvocation: Optional [Text]
+        newCapabilityDelegation: Optional [Text]
+        newService: Optional [Service]
+      controller ledgerController
+      do
+        create this with
+          alsoKnownAs = newAlsoKnownAs
+          verificationMethod = newVerificationMethod
+          authentication = newAuthentication
+          assertionMethod = newAssertionMethod
+          keyAgreement = newKeyAgreement
+          capabilityInvocation = newCapabilityInvocation
+          capabilityDelegation = newCapabilityDelegation
+          service = newService
+
+    -- | Deactivates the DID Document by archiving it from the ledger.
+    -- Once deactivated, the DID should be considered permanently unusable. This is a consuming choice.
+    choice Deactivate : ()
+      controller ledgerController
+      do
+        pure ()
