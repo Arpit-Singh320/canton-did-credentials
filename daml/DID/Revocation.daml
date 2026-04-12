@@ -1,0 +1,96 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module DID.Revocation where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Assert
+
+-- | Defines the possible revocation statuses for a credential.
+-- `Active` means the credential has not been revoked.
+-- `Revoked` means the credential has been revoked by its issuer and is no longer valid.
+data RevocationStatus
+  = Active
+  | Revoked
+  deriving (Eq, Show, Ord)
+
+-- | Represents a W3C-compatible Status List for tracking the revocation status of credentials.
+-- The issuer of credentials is the sole signatory and controller of this list.
+-- Each credential issued against this list is assigned a unique, sequential index.
+-- If an index is present in the `revokedIndices` set, the corresponding credential
+-- is considered revoked. This provides a simple and efficient on-ledger mechanism
+-- for verifiers to check if a presented credential is still valid.
+--
+-- See: https://www.w3.org/TR/vc-status-list/
+template StatusList
+  with
+    issuer: Party
+      -- ^ The party that issues credentials and controls this revocation list.
+    observers: [Party]
+      -- ^ Parties who can observe the status list but cannot modify it.
+    id: Text
+      -- ^ A unique identifier for the status list, typically a URI.
+    revokedIndices: Set Int
+      -- ^ The set of indices corresponding to revoked credentials.
+    nextIndex: Int
+      -- ^ The next available index to be assigned to a new credential.
+  where
+    signatory issuer
+    observer observers
+
+    key (issuer, id) : (Party, Text)
+    maintainer key._1
+
+    -- | Assign the next available index to a new credential.
+    -- This is typically called by the issuer during the credential issuance process.
+    -- The assigned index should be stored within the `credentialStatus` property of
+    -- the Verifiable Credential.
+    choice AssignIndex
+      : (ContractId StatusList, Int)
+      -- ^ Returns the contract ID of the updated status list and the newly assigned index.
+      controller issuer
+      do
+        let assignedIndex = nextIndex
+        newCid <- create this with
+          nextIndex = nextIndex + 1
+        return (newCid, assignedIndex)
+
+    -- | Revoke a credential by adding its index to the `revokedIndices` set.
+    -- This action is permanent and cannot be undone. Once revoked, a credential's
+    -- status will always be `Revoked`.
+    choice RevokeByIndex
+      : ContractId StatusList
+      with
+        indexToRevoke: Int
+          -- ^ The index of the credential to revoke.
+      controller issuer
+      do
+        -- Ensure the index is a valid, previously assigned index.
+        assertMsg ("Index " <> show indexToRevoke <> " has not been assigned yet.")
+          (indexToRevoke < nextIndex && indexToRevoke >= 0)
+
+        -- Ensure the credential is not already revoked to prevent redundant transactions.
+        assertMsg ("Credential with index " <> show indexToRevoke <> " is already revoked.")
+          (not $ Set.member indexToRevoke revokedIndices)
+
+        create this with
+          revokedIndices = Set.insert indexToRevoke revokedIndices
+
+    -- | Check the revocation status of a credential by its index.
+    -- This is a non-consuming choice that can be called by any stakeholder
+    -- on the contract (issuer or observers) to verify a credential's validity.
+    nonconsuming choice GetStatusByIndex
+      : RevocationStatus
+      with
+        indexToCheck: Int
+          -- ^ The index of the credential to check.
+      controller (issuer :: observers)
+      do
+        -- An index that has not been assigned yet is considered active by default,
+        -- as it cannot have been revoked.
+        if Set.member indexToCheck revokedIndices
+          then return Revoked
+          else return Active
