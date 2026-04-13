@@ -1,0 +1,157 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Defines the concept of a Trust Anchor, a fundamental component in a
+-- | decentralized identity ecosystem. A Trust Anchor is a recognized authority
+-- | that can vouch for the credibility of credential issuers. This module
+-- | provides a registry for these anchors, allowing relying parties to verify
+-- | that a presented credential was issued by an entity they trust for a
+-- | specific domain (e.g., KYC, accreditation).
+module DID.TrustAnchor where
+
+import Daml.Script
+
+-- | Represents a trusted entity (issuer) within a specific trust framework,
+-- | operated by an anchor. Relying parties use this registry to verify that a
+-- | credential was issued by an entity they trust.
+template TrustAnchorRole
+  with
+    anchor      : Party
+      -- ^ The operator of the trust registry (e.g., a consortium, a regulator).
+    issuer      : Party
+      -- ^ The party designated as a trusted credential issuer.
+    description : Text
+      -- ^ A human-readable description of the issuer and their function.
+    domains     : [Text]
+      -- ^ A list of credential domains this issuer is trusted for.
+      -- ^ E.g., ["KYC", "AccreditedInvestor", "US_Jurisdiction"].
+    metadataUrl : Optional Text
+      -- ^ An optional URL pointing to more information about the issuer,
+      -- ^ such as their public DID document or governance policies.
+  where
+    signatory anchor
+    observer issuer
+
+    key (anchor, issuer) : (Party, Party)
+    maintainer key._1
+
+    -- | A non-consuming choice that allows any party to verify if an issuer is
+    -- | trusted for a specific domain. This is a crucial check for relying
+    -- | parties before accepting a verifiable credential. It fails if the issuer
+    -- | is not registered for the specified domain.
+    nonconsuming choice AssertIsTrustedIssuer : ()
+      with
+        requester: Party
+          -- ^ The party performing the check (e.g., a service provider).
+        domain: Text
+          -- ^ The specific domain to verify trust for (e.g., "KYC").
+      controller requester
+      do
+        assertMsg (show issuer <> " is not a trusted issuer for the domain '" <> domain <> "' by anchor " <> show anchor <> ".")
+                  (elem domain domains)
+        return ()
+
+    -- | Allows the trust anchor to revoke the trusted status of an issuer.
+    -- | This will archive the `TrustAnchorRole` contract, effectively removing
+    -- | the issuer from the trusted list.
+    choice RevokeTrustAnchorRole : ()
+      controller anchor
+      do
+        return ()
+
+
+-- | An invitation from a trust anchor to a party to become a recognized
+-- | credential issuer. This follows the standard proposal/acceptance pattern.
+template TrustAnchorInvitation
+  with
+    anchor      : Party
+      -- ^ The trust registry operator sending the invitation.
+    issuer      : Party
+      -- ^ The party being invited to become a trusted issuer.
+    description : Text
+      -- ^ The description of the role being offered.
+    domains     : [Text]
+      -- ^ The specific domains for which the issuer will be trusted.
+    metadataUrl : Optional Text
+      -- ^ The metadata URL associated with the role.
+  where
+    signatory anchor
+    observer issuer
+
+    -- | The designated issuer accepts the invitation, creating the
+    -- | corresponding `TrustAnchorRole` contract on the ledger.
+    choice Accept : ContractId TrustAnchorRole
+      controller issuer
+      do
+        create TrustAnchorRole with ..
+
+    -- | The designated issuer declines the invitation, archiving this contract.
+    choice Decline : ()
+      controller issuer
+      do
+        return ()
+
+    -- | The trust anchor withdraws the invitation before it is accepted,
+    -- | archiving this contract.
+    choice Withdraw : ()
+      controller anchor
+      do
+        return ()
+
+-- | A setup script for demonstration and testing purposes.
+setup : Script ()
+setup = script do
+  -- 1. Allocate parties for the scenario.
+  gov <- allocatePartyWithHint "Government" (PartyIdHint "government")
+  bank <- allocatePartyWithHint "Bank" (PartyIdHint "bank")
+  exchange <- allocatePartyWithHint "CryptoExchange" (PartyIdHint "cryptoexchange")
+
+  -- 2. The Government, acting as the Trust Anchor, invites a regulated Bank
+  --    to become a trusted issuer for KYC and AML credentials.
+  let bankInvitation = TrustAnchorInvitation with
+        anchor = gov
+        issuer = bank
+        description = "A regulated financial institution authorized to perform KYC checks."
+        domains = ["KYC", "AML"]
+        metadataUrl = Some "https://bank.example.com/did.json"
+
+  invitationCid <- submit gov do
+    createCmd bankInvitation
+  debug $ "Government invited Bank to be a trusted issuer."
+
+  -- 3. The Bank accepts the invitation, creating a `TrustAnchorRole` contract.
+  bankRoleCid <- submit bank do
+    exerciseCmd invitationCid Accept
+  debug $ "Bank accepted the trust anchor role."
+
+  -- 4. A Crypto Exchange (a Relying Party) verifies that the Bank is a trusted
+  --    issuer for the "KYC" domain before onboarding a new user.
+  submit exchange do
+    exerciseCmd bankRoleCid AssertIsTrustedIssuer with
+      requester = exchange
+      domain = "KYC"
+  debug $ "Exchange successfully verified Bank is a trusted KYC issuer."
+
+  -- 5. The Exchange attempts to verify the Bank for a domain it is not
+  --    approved for ("AccreditedInvestor"). This transaction must fail.
+  submitMustFail exchange do
+    exerciseCmd bankRoleCid AssertIsTrustedIssuer with
+      requester = exchange
+      domain = "AccreditedInvestor"
+  debug $ "Exchange correctly failed to verify Bank for an unapproved domain."
+
+  -- 6. The Government decides to revoke the Bank's trusted status.
+  submit gov do
+    exerciseCmd bankRoleCid RevokeTrustAnchorRole
+  debug $ "Government revoked Bank's trusted issuer status."
+
+  -- 7. After revocation, any further attempt by the Exchange to verify the Bank's
+  --    status must fail, even for the previously approved "KYC" domain.
+  submitMustFail exchange do
+    exerciseCmd bankRoleCid AssertIsTrustedIssuer with
+      requester = exchange
+      domain = "KYC"
+  debug $ "Exchange correctly failed to verify Bank after its role was revoked."
+
+  debug "Trust Anchor setup script completed successfully."
+  return ()
