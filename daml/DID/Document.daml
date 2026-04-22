@@ -3,94 +3,84 @@
 
 module DID.Document where
 
-import DA.Text as T
-import DA.Set (Set)
-import qualified DA.Set as Set
+import DA.Text (splitOn, show)
+import DA.List (elem, all, filter, notElem)
 
--- | Represents a W3C-compatible Verification Method. This data type is used to
--- | express cryptographic material, such as public keys, that can be used to
--- | authenticate or authorize interactions with the DID subject.
--- | See: https://www.w3.org/TR/did-core/#verification-methods
-data VerificationMethod = VerificationMethod with
-  id: Text                 -- ^ A DID URL identifying the verification method, e.g., "did:example:123#keys-1".
-  methodType: Text         -- ^ The type of the verification method, e.g., "Ed25519VerificationKey2020".
-  controller: Text         -- ^ The DID that controls this verification method.
-  publicKeyMultibase: Text -- ^ The public key, encoded in IETF RFC 4648 multibase format.
+-- | Represents a W3C-compliant verification method within a DID Document.
+-- A verification method expresses a cryptographic public key, which can be used
+-- to authenticate or authorize interactions with the DID subject or associated parties.
+-- See: https://www.w3.org/TR/did-core/#verification-methods
+data VerificationMethod = VerificationMethod
+  with
+    id : Text                 -- ^ Fully qualified URI, e.g., "did:canton:123...#key-1"
+    verificationMethodType : Text -- ^ The type of the verification method, e.g., "Ed25519VerificationKey2020".
+    controller : Text         -- ^ The DID URI of the entity that controls this verification method.
+    publicKeyMultibase : Text -- ^ The public key, encoded in multibase format (e.g., 'z' prefix for base58btc).
   deriving (Eq, Show)
 
--- | Represents a W3C-compatible Service Endpoint. Services are used to express
--- | ways of communicating with the DID subject, such as a repository for
--- | verifiable credentials.
--- | See: https://www.w3.org/TR/did-core/#services
-data Service = Service with
-  id: Text                 -- ^ A DID URL identifying the service, e.g., "did:example:123#vcs".
-  serviceType: Text        -- ^ The type of the service, e.g., "VerifiableCredentialRepository".
-  serviceEndpoint: Text    -- ^ The URI of the service endpoint.
+-- | Represents a service endpoint in a DID Document.
+-- Services are used to express ways of communicating with the DID subject or associated entities.
+-- See: https://www.w3.org/TR/did-core/#services
+data Service = Service
+  with
+    id : Text              -- ^ Fully qualified URI, e.g., "did:canton:123...#service-1"
+    serviceType : Text     -- ^ The type of the service, e.g., "VerifiableCredentialApi".
+    serviceEndpoint : Text -- ^ The URL of the service endpoint.
   deriving (Eq, Show)
 
--- | Helper function to check if a list of reference IDs are all present in the master set of method IDs.
-allReferencesAreValid : Set Text -> [Text] -> Bool
-allReferencesAreValid methodIds refs =
-  all (\ref -> Set.member ref methodIds) refs
-
--- | Helper function to check optional lists of reference IDs against the master set of method IDs.
-optionalReferencesAreValid : Set Text -> Optional [Text] -> Bool
-optionalReferencesAreValid methodIds optRefs =
-  case optRefs of
-    None -> True
-    Some refs -> allReferencesAreValid methodIds refs
-
--- | Represents a W3C-compatible Decentralized Identifier (DID) Document on the Canton ledger.
--- This template stores the core components of a DID, such as verification methods and services,
--- enabling on-ledger resolution and management of DIDs. It serves as the root of trust for
--- any verifiable credentials issued by this DID.
+-- | A Daml representation of a W3C Decentralized Identifier (DID) Document.
+-- This contract stores the public keys, authentication methods, and service endpoints
+-- associated with a decentralized identity, controlled by a specific party on the Canton ledger.
+-- The structure is designed to be compatible with the W3C DID Core specification, enabling
+-- interoperable, self-sovereign identity on a privacy-preserving DLT.
+-- See: https://www.w3.org/TR/did-core/
 template DIDDocument
   with
-    did: Text                     -- ^ The DID URI string (e.g., "did:canton:123..."). This is the unique identifier.
-    ledgerController: Party       -- ^ The Daml party who has control over this DID Document contract on the ledger.
-    alsoKnownAs: Optional [Text]  -- ^ Optional list of other URIs for the DID subject.
-    verificationMethod: [VerificationMethod] -- ^ List of cryptographic keys and other verification methods.
-    authentication: [Text]        -- ^ Method IDs from `verificationMethod` used for authentication.
-    assertionMethod: [Text]       -- ^ Method IDs from `verificationMethod` used for asserting claims (e.g., signing VCs).
-    keyAgreement: Optional [Text] -- ^ Method IDs used for key agreement (encryption).
-    capabilityInvocation: Optional [Text] -- ^ Method IDs used for invoking capabilities.
-    capabilityDelegation: Optional [Text] -- ^ Method IDs used for delegating capabilities.
-    service: Optional [Service]   -- ^ List of service endpoints associated with the DID.
-
+    did : Text                     -- ^ The full DID URI, e.g., "did:canton:1220..."
+    controller : Party             -- ^ The party on the Canton network that controls this DID.
+    alsoKnownAs : Optional [Text]  -- ^ Optional list of alternative URIs for the DID subject.
+    verificationMethod : [VerificationMethod] -- ^ List of verification methods (e.g., public keys).
+    authentication : [Text]        -- ^ IDs of verification methods used for authentication purposes.
+    assertionMethod : [Text]       -- ^ IDs of verification methods used for making assertions (e.g., signing credentials).
+    keyAgreement : [Text]          -- ^ IDs of verification methods used for establishing encrypted communication.
+    capabilityInvocation : [Text]  -- ^ IDs of verification methods used for invoking capabilities (e.g., writing to a resource).
+    capabilityDelegation : [Text]  -- ^ IDs of verification methods used for delegating capabilities.
+    service : [Service]            -- ^ List of service endpoints for interacting with the DID subject.
+    observers : [Party]            -- ^ Parties who can observe this DID Document.
   where
-    signatory ledgerController
+    signatory controller
+    observer observers
 
-    unique key did : Text
+    key (did, controller) : (Text, Party)
+    maintainer key._2
 
-    ensure
-      let
-        -- Create a Set of all verification method IDs for efficient lookup.
-        methodIdSet = Set.fromList $ map (\vm -> vm.id) verificationMethod
-      in
-        -- The DID must conform to the basic "did:" prefix format.
-        T.isPrefixOf "did:" did &&
-          -- All verification relationship references must point to a valid verification method.
-          allReferencesAreValid methodIdSet authentication &&
-          allReferencesAreValid methodIdSet assertionMethod &&
-          optionalReferencesAreValid methodIdSet keyAgreement &&
-          optionalReferencesAreValid methodIdSet capabilityInvocation &&
-          optionalReferencesAreValid methodIdSet capabilityDelegation
-
-    -- | Updates the entire DID Document. This is a consuming choice that archives the current
-    -- | document and creates a new one with the provided data. This is the standard pattern for
-    -- | DID lifecycle events like key rotation or service endpoint updates.
-    choice Update : ContractId DIDDocument
+    -- | Updates the entire DID document's properties, except for the `did` and `controller`.
+    -- This choice allows for atomic updates to verification methods, services, and other
+    -- metadata. It ensures internal consistency by verifying that all referenced
+    -- verification method IDs exist in the provided `newVerificationMethod` list.
+    nonconsuming choice Update : ContractId DIDDocument
       with
-        newAlsoKnownAs: Optional [Text]
-        newVerificationMethod: [VerificationMethod]
-        newAuthentication: [Text]
-        newAssertionMethod: [Text]
-        newKeyAgreement: Optional [Text]
-        newCapabilityInvocation: Optional [Text]
-        newCapabilityDelegation: Optional [Text]
-        newService: Optional [Service]
-      controller ledgerController
+        newAlsoKnownAs : Optional [Text]
+        newVerificationMethod : [VerificationMethod]
+        newAuthentication : [Text]
+        newAssertionMethod : [Text]
+        newKeyAgreement : [Text]
+        newCapabilityInvocation : [Text]
+        newCapabilityDelegation : [Text]
+        newService : [Service]
+      controller controller
       do
+        -- Validate that all relationship method IDs exist in the new verificationMethod list.
+        -- This prevents creating a DID document with dangling references.
+        let allMethodIds = map (\vm -> vm.id) newVerificationMethod
+        let allRelationshipIds = newAuthentication ++ newAssertionMethod ++ newKeyAgreement ++ newCapabilityInvocation ++ newCapabilityDelegation
+        assertMsg "All verification relationship IDs must exist in the verificationMethod list" $
+          all (\id -> elem id allMethodIds) allRelationshipIds
+
+        -- Validate that the controller of each verification method is this DID.
+        assertMsg "The controller of all verification methods must be this DID" $
+          all (\vm -> vm.controller == did) newVerificationMethod
+
         create this with
           alsoKnownAs = newAlsoKnownAs
           verificationMethod = newVerificationMethod
@@ -101,9 +91,46 @@ template DIDDocument
           capabilityDelegation = newCapabilityDelegation
           service = newService
 
-    -- | Deactivates the DID Document by archiving it from the ledger.
-    -- Once deactivated, the DID should be considered permanently unusable. This is a consuming choice.
-    choice Deactivate : ()
-      controller ledgerController
+    -- | Adds a list of new parties to the observer set of the DID Document.
+    -- This allows the controller to grant visibility to other participants on the network.
+    choice AddObservers : ContractId DIDDocument
+      with
+        newObservers : [Party]
+      controller controller
       do
-        pure ()
+        -- Avoid adding duplicate observers
+        let uniqueNewObservers = filter (\o -> notElem o observers) newObservers
+        create this with observers = observers ++ uniqueNewObservers
+
+    -- | Removes a list of parties from the observer set.
+    choice RemoveObservers : ContractId DIDDocument
+      with
+        observersToRemove : [Party]
+      controller controller
+      do
+        create this with observers = filter (\o -> notElem o observersToRemove) observers
+
+-- | Constructs a Canton DID URI from a Party.
+-- The DID method is `canton` and the method-specific identifier is the
+-- party's unique fingerprint, ensuring global uniqueness on the network.
+-- Example: A party with string representation "Alice::1220ab..." becomes "did:canton:1220ab...".
+partyToDid : Party -> Text
+partyToDid p = "did:canton:" <> partyFingerprint
+  where
+    parts = splitOn "::" (show p)
+    -- A valid Party string representation is "DisplayName::Fingerprint"
+    partyFingerprint = case parts of
+      [_, fp] -> fp
+      _       -> error $ "Invalid party format for conversion to DID: " <> show p
+
+-- | Constructs a fully qualified verification method ID from a DID and a key identifier fragment.
+-- This creates a URI that is unique within the DID document.
+-- Example: ("did:canton:1220...", "key-1") becomes "did:canton:1220...#key-1".
+createVerificationMethodId : Text -> Text -> Text
+createVerificationMethodId did keyId = did <> "#" <> keyId
+
+-- | Constructs a fully qualified service ID from a DID and a service identifier fragment.
+-- This creates a URI for a service endpoint that is unique within the DID document.
+-- Example: ("did:canton:1220...", "vcs") becomes "did:canton:1220...#vcs".
+createServiceId : Text -> Text -> Text
+createServiceId did serviceId = did <> "#" <> serviceId
