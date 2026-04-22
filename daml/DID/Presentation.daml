@@ -5,231 +5,158 @@ module DID.Presentation where
 
 import Daml.Script
 import DA.Set (Set)
-import qualified DA.Set as Set
-import DA.Assert
-import DA.Time (Time, getTime)
-import DA.Optional (Optional)
-import DA.Foldable (forA_)
 import DA.Text (Text)
+import DA.Time (Time)
 
-import DID.Credential (VerifiableCredential(..))
+import DID.Credential (VerifiableCredential)
 
--- | A Verifiable Presentation is a data structure used to present Verifiable Credentials
--- | to a verifier. It is created by a holder and presented to a verifier. The presentation
--- | itself is signed by the holder. This workflow uses a proposal/accept pattern where
--- | a verifier first requests a presentation.
+-- | Represents the proof metadata associated with a Verifiable Presentation.
+-- In the context of Daml, the cryptographic signature is implicitly handled by the ledger's
+-- authorization model (i.e., the signatories of the transaction).
+data PresentationProof = PresentationProof
+  { proofType : Text
+    -- ^ The type of the proof, e.g., "DamlLedgerProof-2024".
+  , created : Time
+    -- ^ The timestamp of when the presentation was created.
+  , proofPurpose : Text
+    -- ^ The purpose for which the presentation was created, e.g., "authentication" or "kyc-verification".
+  , verificationMethod : Text
+    -- ^ A URI identifying the verification method, typically the holder's DID.
+  } deriving (Eq, Show)
 
--- | A verifier can request a presentation from a holder, optionally providing a domain
--- | and challenge to prevent replay attacks.
-template PresentationRequest
+-- | Represents a single, selectively disclosed claim from a Verifiable Credential.
+data PresentedClaim = PresentedClaim
+  { claimKey : Text
+    -- ^ The key or name of the claim, e.g., "countryOfResidence".
+  , claimValue : Text
+    -- ^ The value of the claim, e.g., "CH".
+  } deriving (Eq, Show)
+
+-- | Represents a credential that is being presented, containing only a subset of
+-- the original claims for privacy-preserving selective disclosure.
+-- This data is copied from the original Verifiable Credential contract.
+data PresentedCredential = PresentedCredential
+  { originalIssuer : Party
+    -- ^ The party who issued the original credential.
+  , originalIssuanceDate : Time
+    -- ^ The issuance date of the original credential.
+  , credentialType : Text
+    -- ^ The type of the original credential, e.g., "KYCCredential".
+  , claims : [PresentedClaim]
+    -- ^ The list of claims being selectively disclosed from the original credential.
+  } deriving (Eq, Show)
+
+
+-- | A proposal from a credential holder to a verifier, containing a set of
+-- selectively disclosed credentials for a specific purpose. This is the first
+-- step in the two-phase commit pattern for sharing a Verifiable Presentation.
+template VerifiablePresentationProposal
   with
-    verifier : Party
-      -- ^ The party requesting the presentation.
     holder : Party
-      -- ^ The party from whom the presentation is requested.
-    id: Text
-      -- ^ A unique identifier for this request.
-    domain : Optional Text
-      -- ^ A domain or URI to prevent replay attacks, specified by the verifier.
-    challenge : Optional Text
-      -- ^ A nonce or challenge string provided by the verifier.
-    requestDate: Time
-      -- ^ The time the request was made.
-  where
-    signatory verifier
-    observer holder
-
-    key (verifier, holder, id) : (Party, Party, Text)
-    maintainer key._1
-
-    choice Present : ContractId VerifiablePresentation
-      -- ^ The holder presents a set of credentials in response to the request.
-      with
-        verifiableCredentialCids : Set (ContractId VerifiableCredential)
-          -- ^ The set of credentials being presented.
-      controller holder
-      do
-        -- Ensure the presentation is not empty
-        assertMsg "Presentation must contain at least one credential" (not $ Set.isEmpty verifiableCredentialCids)
-
-        -- Fetch all credentials and verify that the holder is the subject of each one.
-        -- This is a critical security check to prevent presenting someone else's credentials.
-        forA_ (Set.toList verifiableCredentialCids) \cid -> do
-          cred <- fetch cid
-          cred.subject === holder
-            `assertMsg` "Holder is not the subject of all presented credentials."
-
-        presentationTime <- getTime
-
-        -- Create the Verifiable Presentation
-        create VerifiablePresentation with
-          id = "vp-" <> id
-          , holder
-          , verifier
-          , verifiableCredentialCids
-          , issuanceDate = presentationTime
-          , domain
-          , challenge
-
--- | A presentation of one or more Verifiable Credentials, created by a holder
--- | and sent to a verifier.
-template VerifiablePresentation
-  with
-    id : Text
-      -- ^ A unique identifier for the presentation.
-    holder : Party
-      -- ^ The party who holds the credentials and created the presentation.
+      -- ^ The party presenting the credentials (the "prover").
     verifier : Party
-      -- ^ The party to whom the presentation is being made.
-    verifiableCredentialCids : Set (ContractId VerifiableCredential)
-      -- ^ A set of contract IDs pointing to the credentials being presented.
-    issuanceDate : Time
-      -- ^ The timestamp when the presentation was created.
-    domain : Optional Text
-      -- ^ The domain from the original `PresentationRequest`.
-    challenge : Optional Text
-      -- ^ The challenge from the original `PresentationRequest`.
+      -- ^ The party to whom the credentials are being presented.
+    presentationId : Text
+      -- ^ A unique identifier for this presentation, scoped to the holder.
+    presentedCredentials : [PresentedCredential]
+      -- ^ A list of credentials with selectively disclosed claims.
+    proof : PresentationProof
+      -- ^ Metadata about the presentation's creation and purpose.
+    controllers: Set Party
+      -- ^ Additional parties who can control the lifecycle of this proposal,
+      --   typically the holder.
   where
     signatory holder
     observer verifier
 
-    key (holder, verifier, id) : (Party, Party, Text)
-    maintainer key._1
+    ensure
+      holder `elem` controllers
 
-    -- The holder must be the subject of all presented credentials.
-    -- This check is performed in the `Present` choice of `PresentationRequest`,
-    -- which is the only way to create this contract.
-
-    choice Verify : ContractId VerifiedPresentation
-      -- ^ The verifier checks the presented credentials and, if valid, accepts them.
+    choice Accept : ContractId VerifiablePresentation
+      -- ^ The verifier accepts the presentation, creating a shared, immutable
+      --   record of the event on the ledger.
       controller verifier
       do
-        -- In a production system, the verifier would perform several checks:
-        -- 1. Verify the holder is the subject of each credential (already done on create, but good to re-affirm).
-        -- 2. Check the issuance and expiration dates of each credential.
-        -- 3. Check the status of each credential against a revocation registry.
-        -- 4. Verify the claims within the credentials meet their business requirements.
+        create VerifiablePresentation with
+          holder
+          verifier
+          presentationId
+          presentedCredentials
+          proof
 
-        forA_ (Set.toList verifiableCredentialCids) \cid -> do
-          cred <- fetch cid
-          -- Re-affirm subject matches holder
-          cred.subject === holder
-            `assertMsg` "Verification failed: Holder is not the subject of a presented credential."
+    choice Reject : ()
+      -- ^ The verifier rejects the presentation. The proposal is archived.
+      controller verifier
+      do pure ()
 
-          -- NOTE: Revocation check would be performed here.
-          -- This would typically involve fetching a `RevocationRegistry` contract
-          -- (identified by the `issuer` of the credential) and calling a choice
-          -- to check if the credential's ID has been revoked.
-          -- e.g., `exercise registryCid IsRevoked with credentialId = cred.id`
-
-        verificationTime <- getTime
-
-        -- If all checks pass, archive the presentation and create a record of the successful verification.
-        archive self
-        create VerifiedPresentation with
-          id = "verified-" <> id
-          , ..
-          , verificationDate = verificationTime
-
-    choice ArchivePresentation : ()
-      -- ^ The holder can withdraw/archive the presentation before it's verified.
+    choice Withdraw : ()
+      -- ^ The holder withdraws the presentation proposal before it is accepted
+      --   or rejected.
       controller holder
-      do
-        archive self
+      do pure ()
 
--- | A record indicating that a `VerifiablePresentation` has been successfully
--- | processed and verified by the `verifier`. This serves as a non-repudiable
--- | receipt of verification.
-template VerifiedPresentation
+-- | An immutable, shared contract representing a Verifiable Presentation that
+-- has been accepted by a verifier. This serves as a durable record that the
+-- holder successfully proved a set of claims to the verifier at a specific point
+-- in time.
+template VerifiablePresentation
   with
-    id : Text
-      -- ^ The unique identifier of the original presentation, prefixed.
     holder : Party
-      -- ^ The party who holds the credentials.
+      -- ^ The party who presented the credentials.
     verifier : Party
-      -- ^ The party who verified the presentation.
-    verifiableCredentialCids : Set (ContractId VerifiableCredential)
-      -- ^ The set of credential CIDs that were verified.
-    issuanceDate : Time
-      -- ^ The timestamp when the original presentation was created.
-    verificationDate: Time
-      -- ^ The timestamp when the verification occurred.
-    domain : Optional Text
-      -- ^ The domain from the original `PresentationRequest`.
-    challenge : Optional Text
-      -- ^ The challenge from the original `PresentationRequest`.
+      -- ^ The party who verified the credentials.
+    presentationId : Text
+      -- ^ The unique identifier for this presentation.
+    presentedCredentials : [PresentedCredential]
+      -- ^ The final, agreed-upon set of selectively disclosed claims.
+    proof : PresentationProof
+      -- ^ The proof metadata associated with the presentation.
   where
-    signatory verifier
-    observer holder
+    signatory holder, verifier
 
-    key (verifier, holder, id) : (Party, Party, Text)
-    maintainer key._1
+    key (holder, verifier, presentationId) : (Party, Party, Text)
+    maintainer key._1, key._2
 
-    choice ArchiveVerifiedPresentation : ()
-      -- ^ Either party can archive this receipt when it's no longer needed.
+    choice Archive : ()
+      -- ^ Allows either the holder or verifier to archive this record when it is
+      --   no longer needed for auditing or other purposes.
       controller holder, verifier
-      do
-        archive self
+      do pure ()
 
--- | Example script for setting up and running a presentation workflow.
-test_presentation_workflow : Script ()
-test_presentation_workflow = script do
-  -- 1. Allocate parties
-  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
-  holder <- allocatePartyWithHint "Holder" (PartyIdHint "holder")
-  verifier <- allocatePartyWithHint "Verifier" (PartyIdHint "verifier")
 
-  -- 2. Issuer creates a KYC credential for the holder
-  issueTime <- getTime
-  let credPayload = VerifiableCredential with
-        id = "kyc-cred-123"
-        issuer
-        subject = holder
-        issuanceDate = issueTime
-        expirationDate = None
-        credentialType = "KYCCredential"
-        claims = "{\"name\":\"Alice\",\"dob\":\"1990-01-15\",\"country\":\"US\"}"
+-- | A helper function for Daml Script tests to create a presentation proposal.
+-- It fetches the specified credentials, filters their claims, and creates the proposal.
+createPresentationProposal : Party -> Party -> Text -> [(ContractId VerifiableCredential, [Text])] -> Script (ContractId VerifiablePresentationProposal)
+createPresentationProposal holder verifier presentationId credentialsToPresent = do
+  -- Build the list of PresentedCredential data structures
+  presentedCreds <- forA credentialsToPresent \(credCid, claimKeys) -> do
+    cred <- fetch credCid
+    let
+      -- Filter the claims based on the provided keys
+      filteredClaims = filter (\c -> c.claimKey `elem` claimKeys) cred.credentialSubject.claims
+      presentedClaims = map (\c -> PresentedClaim with claimKey = c.claimKey, claimValue = c.claimValue) filteredClaims
 
-  kycCredCid <- submit issuer do create credPayload
+    return PresentedCredential with
+      originalIssuer = cred.issuer
+      originalIssuanceDate = cred.issuanceDate
+      credentialType = cred.credentialType
+      claims = presentedClaims
 
-  -- 3. Verifier requests a presentation from the holder
-  requestTime <- getTime
-  let request = PresentationRequest with
-        verifier
-        holder
-        id = "request-abc-456"
-        domain = Some "https://myapp.com/login"
-        challenge = Some "a_very_random_nonce_string_for_this_session"
-        requestDate = requestTime
+  -- Create the proof
+  now <- getTime
+  let
+    proof = PresentationProof with
+      proofType = "DamlLedgerProof-2024"
+      created = now
+      proofPurpose = "kyc-verification"
+      verificationMethod = partyToText holder -- Simplified DID representation
 
-  requestCid <- submit verifier do create request
-
-  -- 4. Holder sees the request and presents the KYC credential
-  let presentedCids = Set.fromList [kycCredCid]
-  presentationCid <- submit holder do
-    exercise requestCid Present with
-      verifiableCredentialCids = presentedCids
-
-  -- 5. Verifier receives the presentation and verifies it
-  verifiedPresentationCid <- submit verifier do
-    exercise presentationCid Verify
-
-  -- 6. Check the final state
-  Some verifiedContract <- queryContractId verifier verifiedPresentationCid
-  verifiedContract.holder === holder
-  verifiedContract.verifier === verifier
-  Set.size verifiedContract.verifiableCredentialCids === 1
-
-  -- 7. Holder fails to present a credential they don't own
-  otherHolder <- allocatePartyWithHint "OtherHolder" (PartyIdHint "otherholder")
-  otherCredCid <- submit issuer do
-    create credPayload with subject = otherHolder
-
-  request2Cid <- submit verifier do
-    create request with id = "request-def-789"
-
-  submitMustFail holder do
-    exercise request2Cid Present with
-      verifiableCredentialCids = Set.fromList [otherCredCid]
-
-  return ()
+  -- Submit the proposal
+  submit holder do
+    createCmd VerifiablePresentationProposal with
+      holder
+      verifier
+      presentationId
+      presentedCredentials = presentedCreds
+      proof
+      controllers = DA.Set.fromList [holder]
