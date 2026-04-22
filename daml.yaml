@@ -1,4 +1,4 @@
-sdk-version: 3.1.0
+sdk-version: 3.4.0
 name: canton-did-credentials
 version: 0.1.0
 source: daml
@@ -6,17 +6,5 @@ dependencies:
   - daml-prim
   - daml-stdlib
   - daml-script
-parties:
-  - Alice
-  - Bob
-  - Issuer
-  - Verifier
-  - RevocationRegistryOperator
-start-navigator: true
-start-json-api: true
-json-api-options:
-  - --port=7575
-  - --address=0.0.0.0
-  - --allow-insecure-tokens
 build-options:
   - --target=2.1
