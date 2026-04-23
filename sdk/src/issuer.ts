@@ -1,229 +1,196 @@
 /**
- * @module issuer
- * @description This module provides a client-side SDK for credential issuers to interact
- * with the Daml-based Verifiable Credential ledger. It abstracts the complexities of
- * the Daml Ledger JSON API, offering simple functions to issue, revoke, and query
-* credentials.
+ * @module canton-did-credentials
+ * @description
+ * TypeScript SDK for Verifiable Credential Issuers.
+ *
+ * This module provides the `IssuerService` class, a high-level API for interacting
+ * with the Daml-based credential contracts on a Canton ledger. It simplifies the
+ * process of creating and revoking W3C-compatible Verifiable Credentials.
+ *
+ * The service communicates with the ledger's JSON API.
+ *
+ * @example
+ * ```ts
+ * import { IssuerService } from './issuer';
+ *
+ * const config = {
+ *   partyId: 'IssuerParty::1220...',
+ *   token: 'your-jwt-token',
+ *   httpBaseUrl: 'http://localhost:7575',
+ * };
+ *
+ * const issuer = new IssuerService(config);
+ *
+ * async function issueKycCredential(holderPartyId) {
+ *   const credentialCid = await issuer.issueCredential({
+ *     holder: holderPartyId,
+ *     claims: {
+ *       "kycStatus": "Verified",
+ *       "jurisdiction": "US",
+ *     },
+ *   });
+ *   console.log(`Issued KYC credential with ID: ${credentialCid}`);
+ * }
+ * ```
  */
 
-import { ContractId, Party } from '@c7/ledger';
-// In a Node.js environment, you would use 'node-fetch'. In a browser, you can use the global fetch.
-// We use a generic type here to be environment-agnostic.
-import { fetch, RequestInit, Response } from 'node-fetch';
+import { randomUUID } from 'crypto';
+
+// Basic type aliases for clarity
+export type PartyId = string;
+export type ContractId = string;
+export type DamlIsoTime = string; // e.g., "2023-10-27T10:00:00.000Z"
 
 /**
- * Configuration for connecting to the Daml Ledger JSON API.
+ * Configuration for connecting to a Canton ledger participant node's JSON API.
  */
 export interface LedgerConfig {
-  /** The hostname or IP address of the JSON API server. */
-  host: string;
-  /** The port number of the JSON API server. */
-  port: number;
-  /** The authentication token (JWT) for the party operating the SDK. */
+  /** The party ID of the issuer. */
+  partyId: PartyId;
+  /** A valid JWT for authenticating with the JSON API. */
   token: string;
+  /** The base URL of the JSON API (e.g., "http://localhost:7575"). */
+  httpBaseUrl: string;
 }
 
 /**
- * Represents the subject of a Verifiable Credential, containing the claims made by the issuer.
- * Corresponds to `DA.Map.Map Text Daml.Json.Json` in Daml.
+ * Arguments for issuing a new Verifiable Credential.
  */
-export type CredentialSubject = Record<string, any>;
-
-/**
- * A generic representation of a Daml contract.
- */
-export interface DamlContract<T = any> {
-  contractId: ContractId<T>;
-  templateId: string;
-  payload: T;
+export interface IssueCredentialArgs {
+  /** The Daml PartyId of the credential holder (subject). */
+  holder: PartyId;
+  /** A unique identifier for the credential. If not provided, a UUID will be generated. */
+  credentialId?: string;
+  /** Optional expiration date in ISO 8601 format. */
+  expirationDate?: DamlIsoTime;
+  /** A key-value map of claims to be included in the credential subject. */
+  claims: Record<string, string>;
 }
 
-/**
- * The payload for a `VerifiableCredentialProposal` contract.
- */
-export interface VerifiableCredentialProposal {
-  issuer: Party;
-  holder: Party;
-  credentialId: string;
-  credentialType: string[];
-  credentialSubject: CredentialSubject;
-  issuanceDate: string; // ISO 8601 Timestamp
-  expirationDate: string | null; // ISO 8601 Timestamp or null
-  revocationListCid: ContractId<any>;
-}
-
-/**
- * The payload for a `VerifiableCredential` contract.
- */
-export interface VerifiableCredential extends VerifiableCredentialProposal {
-  // Assuming the accepted credential has the same data as the proposal.
-}
-
-/**
- * The payload for a `RevocationList` contract.
- */
-export interface RevocationList {
-  issuer: Party;
-  description: string;
-  revokedCredentials: Record<string, string>; // Map from Credential ID to Revocation Timestamp
-}
-
-/**
- * Builds the base URL for JSON API requests.
- * @param config Ledger connection configuration.
- * @returns The base URL string.
- */
-const getApiBaseUrl = (config: LedgerConfig): string => `http://${config.host}:${config.port}`;
-
-/**
- * A generic helper for making requests to the JSON API.
- * @param config Ledger connection configuration.
- * @param endpoint The API endpoint (e.g., 'v1/create').
- * @param body The request body.
- * @returns The JSON response from the API.
- * @throws An error if the API returns a non-200 status.
- */
-async function apiRequest<T>(config: LedgerConfig, endpoint: string, body: object): Promise<T> {
-  const url = `${getApiBaseUrl(config)}/${endpoint}`;
-  const options: RequestInit = {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${config.token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+// Internal types to model JSON API responses
+interface CreateResponse {
+  status: number;
+  result: {
+    contractId: ContractId;
+    [key: string]: unknown;
   };
+  warnings?: unknown;
+  errors?: string[];
+}
 
-  const response: Response = await fetch(url, options);
+interface ExerciseResponse {
+  status: number;
+  result: {
+    exerciseResult: string; // This is a JSON-encoded string of the choice's return value
+    [key: string]: unknown;
+  };
+  warnings?: unknown;
+  errors?: string[];
+}
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`JSON API request failed with status ${response.status}: ${errorBody}`);
+/**
+ * Provides methods for a credential issuer to create and manage credentials on Canton.
+ *
+ * Each instance of this class is configured to act on behalf of a specific issuer party.
+ */
+export class IssuerService {
+  private readonly config: LedgerConfig;
+  private readonly headers: Record<string, string>;
+
+  /**
+   * Constructs an instance of the IssuerService.
+   * @param config - Connection and authentication details for the Canton ledger.
+   */
+  constructor(config: LedgerConfig) {
+    if (!config.httpBaseUrl || !config.token || !config.partyId) {
+      throw new Error("Ledger configuration (httpBaseUrl, token, partyId) is required.");
+    }
+    this.config = config;
+    this.headers = {
+      "Authorization": `Bearer ${this.config.token}`,
+      "Content-Type": "application/json",
+    };
   }
 
-  const json = await response.json();
-  return json.result as T;
-}
+  /**
+   * Issues a new Verifiable Credential to a holder.
+   * This creates a `DID.Credential:VerifiableCredential` contract on the ledger,
+   * signed by the issuer.
+   *
+   * @param args - The details of the credential to issue.
+   * @returns The ContractId of the newly created VerifiableCredential.
+   */
+  async issueCredential(args: IssueCredentialArgs): Promise<ContractId> {
+    const credentialId = args.credentialId || randomUUID();
+    const issuanceDate = new Date().toISOString();
 
-/**
- * Finds the active `RevocationList` contract for a given issuer.
- * Each issuer should have exactly one such list.
- *
- * @param config The ledger connection configuration.
- * @param issuer The party ID of the credential issuer.
- * @returns A promise that resolves to the `RevocationList` contract, or null if not found.
- */
-export async function findRevocationListFor(
-  config: LedgerConfig,
-  issuer: Party
-): Promise<DamlContract<RevocationList> | null> {
-  const query = {
-    templateIds: ['DID.Revocation:RevocationList'],
-    query: { issuer },
-  };
+    const createPayload = {
+      templateId: "DID.Credential:VerifiableCredential",
+      payload: {
+        issuer: this.config.partyId,
+        holder: args.holder,
+        credentialId: credentialId,
+        issuanceDate: issuanceDate,
+        expirationDate: args.expirationDate ? { Some: args.expirationDate } : { None: {} },
+        // Daml `Map` is represented as an array of key-value pairs in the JSON API.
+        credentialSubject: Object.entries(args.claims).map(([key, value]) => ({ _1: key, _2: value })),
+      },
+    };
 
-  const lists = await apiRequest<DamlContract<RevocationList>[]>(config, 'v1/query', query);
-  return lists.length > 0 ? lists[0] : null;
-}
+    const response = await fetch(`${this.config.httpBaseUrl}/v1/create`, {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify(createPayload),
+    });
 
-/**
- * Proposes a new verifiable credential to a holder.
- * This creates a `VerifiableCredentialProposal` contract on the ledger,
- * which the holder must then accept to receive the final credential.
- *
- * @param config The ledger connection configuration.
- * @param args The arguments for creating the credential proposal.
- * @returns A promise that resolves to the created `VerifiableCredentialProposal` contract.
- */
-export async function issueCredentialProposal(
-  config: LedgerConfig,
-  args: {
-    issuer: Party;
-    holder: Party;
-    credentialId: string;
-    credentialType: string[];
-    credentialSubject: CredentialSubject;
-    expirationDate?: Date;
-    revocationListCid: ContractId<RevocationList>;
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Failed to issue credential: ${response.status} ${response.statusText} - ${errorBody}`);
+    }
+
+    const json = await response.json() as CreateResponse;
+    if (json.status !== 200 || !json.result?.contractId) {
+      throw new Error(`Ledger returned an error for create: ${JSON.stringify(json)}`);
+    }
+
+    return json.result.contractId;
   }
-): Promise<DamlContract<VerifiableCredentialProposal>> {
-  const payload = {
-    issuer: args.issuer,
-    holder: args.holder,
-    credentialId: args.credentialId,
-    credentialType: args.credentialType,
-    credentialSubject: args.credentialSubject,
-    issuanceDate: new Date().toISOString(),
-    expirationDate: args.expirationDate ? args.expirationDate.toISOString() : null,
-    revocationListCid: args.revocationListCid,
-  };
 
-  const createCommand = {
-    templateId: 'DID.Credential:VerifiableCredentialProposal',
-    payload,
-  };
+  /**
+   * Revokes a previously issued credential by exercising a choice on its revocation entry.
+   * This operation requires the ContractId of the `DID.Revocation:RevocationListEntry`
+   * contract, which is typically created at the time of issuance.
+   *
+   * @param revocationListEntryCid - The ContractId of the `RevocationListEntry` to update.
+   * @returns The ContractId of the new, revoked `RevocationListEntry` contract.
+   */
+  async revokeCredential(revocationListEntryCid: ContractId): Promise<ContractId> {
+    const exercisePayload = {
+      templateId: "DID.Revocation:RevocationListEntry",
+      contractId: revocationListEntryCid,
+      choice: "Revoke",
+      argument: {},
+    };
 
-  return apiRequest<DamlContract<VerifiableCredentialProposal>>(config, 'v1/create', createCommand);
-}
+    const response = await fetch(`${this.config.httpBaseUrl}/v1/exercise`, {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify(exercisePayload),
+    });
 
-/**
- * Revokes a previously issued verifiable credential.
- * This is done by exercising the `Revoke` choice on the issuer's `RevocationList` contract.
- *
- * @param config The ledger connection configuration.
- * @param revocationListCid The contract ID of the issuer's `RevocationList`.
- * @param credentialId The unique ID of the credential to revoke.
- * @returns A promise that resolves when the revocation is successful.
- */
-export async function revokeCredential(
-  config: LedgerConfig,
-  revocationListCid: ContractId<RevocationList>,
-  credentialId: string
-): Promise<void> {
-  const exerciseCommand = {
-    templateId: 'DID.Revocation:RevocationList',
-    contractId: revocationListCid,
-    choice: 'Revoke',
-    argument: {
-      credentialIdToRevoke: credentialId,
-    },
-  };
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Failed to revoke credential: ${response.status} ${response.statusText} - ${errorBody}`);
+    }
 
-  await apiRequest(config, 'v1/exercise', exerciseCommand);
-}
+    const json = await response.json() as ExerciseResponse;
+    if (json.status !== 200 || !json.result?.exerciseResult) {
+      throw new Error(`Ledger returned an error for exercise: ${JSON.stringify(json)}`);
+    }
 
-/**
- * Finds all active `VerifiableCredentialProposal` contracts issued by a specific party.
- *
- * @param config The ledger connection configuration.
- * @param issuer The party ID of the credential issuer.
- * @returns A promise that resolves to an array of credential proposal contracts.
- */
-export async function findIssuedProposals(
-  config: LedgerConfig,
-  issuer: Party
-): Promise<DamlContract<VerifiableCredentialProposal>[]> {
-  const query = {
-    templateIds: ['DID.Credential:VerifiableCredentialProposal'],
-    query: { issuer },
-  };
-  return apiRequest<DamlContract<VerifiableCredentialProposal>[]>(config, 'v1/query', query);
-}
-
-/**
- * Finds all active (accepted) `VerifiableCredential` contracts issued by a specific party.
- *
- * @param config The ledger connection configuration.
- * @param issuer The party ID of the credential issuer.
- * @returns A promise that resolves to an array of accepted credential contracts.
- */
-export async function findIssuedCredentials(
-  config: LedgerConfig,
-  issuer: Party
-): Promise<DamlContract<VerifiableCredential>[]> {
-  const query = {
-    templateIds: ['DID.Credential:VerifiableCredential'],
-    query: { issuer },
-  };
-  return apiRequest<DamlContract<VerifiableCredential>[]>(config, 'v1/query', query);
+    // The return value of the 'Revoke' choice is the ContractId of the new, updated contract.
+    // The JSON API returns this value as a JSON-encoded string, so it must be parsed.
+    const newContractId = JSON.parse(json.result.exerciseResult) as ContractId;
+    return newContractId;
+  }
 }
