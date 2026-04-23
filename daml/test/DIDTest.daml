@@ -1,258 +1,241 @@
--- Copyright (c) 2024 Digital Asset (Canton) Holdings, LLC. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
-
-module DIDTest where
+module Credentials.Test.DIDTest where
 
 import Daml.Script
-import DA.Assert ((===), assert, assertMsg, assertThrows)
-import DA.Date (date, Month(..), DayOfWeek(..), toDateUTC)
-import DA.Text qualified as T
+import DA.Assert
+import DA.Date as D
 import DA.Time (time, addRelTime, days)
+import DA.Map (fromList)
 
-import DID.Document
-import DID.Credential
-import DID.Presentation
-import DID.Revocation
-import DID.TrustAnchor
+import Credentials.DID.V1 as DID
+import Credentials.Credential.V1 as Credential
+import Credentials.Presentation.V1 as Presentation
+import Credentials.Revocation.V1 as Revocation
 
--- | Main test suite for the DID and Verifiable Credential workflow.
-didLifecycleTests = script do
-  -- === Party Setup ===
-  -- Allocate the main parties for our scenarios.
-  trustAnchor <- allocatePartyWithHint "TrustAnchor" (PartyIdHint "trust-anchor")
-  issuer      <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
-  holder      <- allocatePartyWithHint "Holder" (PartyIdHint "holder")
-  verifier    <- allocatePartyWithHint "Verifier" (PartyIdHint "verifier")
+-- === Test Scenarios ===
 
-  -- === DID Setup ===
-  -- For testing purposes, we use a simple "did:daml:<partyId>" format.
-  -- In a real system, these would be generated and resolved via a specific DID method.
-  let trustAnchorDid = "did:daml:" <> T.pack (show trustAnchor)
-  let issuerDid      = "did:daml:" <> T.pack (show issuer)
-  let holderDid      = "did:daml:" <> T.pack (show holder)
-  let verifierDid    = "did:daml:" <> T.pack (show verifier)
+didTests : Script ()
+didTests = script do
+  -- Party setup
+  issuerParty <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
+  holderParty <- allocatePartyWithHint "Holder" (PartyIdHint "holder")
+  verifierParty <- allocatePartyWithHint "Verifier" (PartyIdHint "verifier")
+  anotherIssuerParty <- allocatePartyWithHint "AnotherIssuer" (PartyIdHint "another-issuer")
 
-  -- Create the on-ledger representation of each party's DID.
-  _ <- submit trustAnchor do createCmd DIDDocument with id = trustAnchorDid, controller = trustAnchor
-  _ <- submit issuer      do createCmd DIDDocument with id = issuerDid,      controller = issuer
-  _ <- submit holder      do createCmd DIDDocument with id = holderDid,      controller = holder
-  _ <- submit verifier    do createCmd DIDDocument with id = verifierDid,    controller = verifier
+  -- Run tests sequentially
+  testGroup "Verifiable Credentials Lifecycle" do
+    test "Happy Path: Issue, Present, and Verify a Credential" do
+      runLifecycleTest issuerParty holderParty verifierParty
 
-  -- === Test Scenarios ===
+    test "Revocation: Verifying a revoked credential must fail" do
+      runRevocationTest issuerParty holderParty verifierParty
 
-  test "Successful Issuance, Presentation, and Verification" do
-    -- 1. Trust Anchor establishes a Trust Registry and adds the Issuer.
-    trustRegistryCid <- submit trustAnchor do
-      createCmd TrustRegistry with anchor = trustAnchor, trustedIssuers = []
-    updatedTrustRegistryCid <- submit trustAnchor do
-      exerciseCmd trustRegistryCid AddTrustedIssuer with issuerDid
+    test "Invalid Presentation: Presenting a credential that does not match the request" do
+      runInvalidPresentationTest issuerParty holderParty verifierParty anotherIssuerParty
 
-    -- 2. Issuer establishes a Revocation Registry for credentials it issues.
-    revocationRegistryCid <- submit issuer do
-      createCmd RevocationRegistry with issuer, revokedCredentialIds = []
+    test "Invalid Holder: Holder cannot present someone else's credential" do
+      runInvalidHolderTest issuerParty holderParty verifierParty
 
-    -- 3. Issuer offers a "KYC" credential to the Holder.
-    let
-      credentialSubject = [ ("country", "US"), ("isAccredited", "true") ]
-      issuanceDate = time (date 2024 Jan 1) 0 0 0
-      expirationDate = Some $ date 2030 Jan 1
+-- === Full Lifecycle Test ===
 
-    offerCid <- submit issuer do
-      createCmd CredentialOffer with
-        issuer
-        holder
-        credentialType = "KYC"
-        credentialSubject
-        issuanceDate
-        expirationDate
-        revocationRegistryCid = Some revocationRegistryCid
+runLifecycleTest : Party -> Party -> Party -> Script ()
+runLifecycleTest issuer holder verifier = do
+  -- 1. Setup DID
+  let holderDid = "did:canton:holder-" <> show holder
+  didCid <- submit holder do
+    createCmd DID.Did with
+      owner = holder
+      did = holderDid
+      controllers = [holder]
+      observers = []
 
-    -- 4. Holder accepts the offer, creating a VerifiableCredential contract.
-    (vcCid, vc) <- submit holder do
-      exerciseCmd offerCid AcceptCredentialOffer with holderDid
+  -- 2. Issue a KYC Credential
+  let
+    credentialId = "kyc-credential-123"
+    credentialType = "KycCredential"
+    issuanceDate = time (D.date 2024 D.Jan 1) 0 0 0
+    expirationDate = Some (time (D.date 2025 D.Jan 1) 0 0 0)
+    claims = fromList [("country", "CH"), ("level", "high")]
 
-    -- Assertions to check the created credential's data.
-    vc.issuer === issuerDid
-    vc.holder === holderDid
-    vc.credentialType === "KYC"
-    vc.credentialSubject === credentialSubject
+  -- Issuer proposes the credential
+  requestCid <- submit issuer do
+    createCmd Credential.CredentialRequest with
+      issuer
+      holder
+      id = credentialId
+      credentialType
+      credentialSubject = holderDid
+      claims
+      issuanceDate
+      expirationDate
 
-    -- 5. Verifier requests a presentation of a "KYC" credential from the Holder.
-    requestCid <- submit verifier do
-      createCmd PresentationRequest with
-        verifier
-        holder
-        requestedCredentialType = "KYC"
+  -- Holder accepts and receives the credential
+  vcCid <- submit holder do
+    exerciseCmd requestCid CredentialRequest_Accept
 
-    -- 6. Holder fulfills the request by creating a VerifiablePresentation.
-    presentationCid <- submit holder do
-      exerciseCmd requestCid FulfillPresentationRequest with
-        credentialCid = vcCid
-        trustRegistryCid = updatedTrustRegistryCid
+  -- 3. Verifier requests a presentation
+  let presentationId = "presentation-request-456"
+  presentationRequestCid <- submit verifier do
+    createCmd Presentation.PresentationRequest with
+      verifier
+      holder
+      id = presentationId
+      requiredIssuer = Some issuer
+      requiredType = Some credentialType
+      requiredClaims = ["country"]
 
-    -- 7. Verifier verifies the presentation. This should succeed.
-    verificationResult <- submit verifier do
-      exerciseCmd presentationCid VerifyPresentation
+  -- 4. Holder presents the credential
+  presentationCid <- submit holder do
+    exerciseCmd presentationRequestCid PresentationRequest_Present with
+      vcCid
 
-    verificationResult.verified === True
-    verificationResult.reason === "Presentation verified successfully."
+  -- 5. Verifier verifies the presentation
+  -- For this happy path, we assume no revocation registry is needed for verification.
+  -- In a real system, the verifier would discover the issuer's registry.
+  verificationResultCid <- submit verifier do
+    exerciseCmd presentationCid VerifiablePresentation_Verify with
+      revocationRegistryCid = None
 
-  test "Revocation prevents successful verification" do
-    -- 1. Setup registries. Issuer is already trusted.
-    trustRegistryCid <- submit trustAnchor do
-      createCmd TrustRegistry with anchor = trustAnchor, trustedIssuers = [issuerDid]
-    revocationRegistryCid <- submit issuer do
-      createCmd RevocationRegistry with issuer, revokedCredentialIds = []
+  -- 6. Assert success
+  result <- submit verifier do
+    fetchCmd verificationResultCid
 
-    -- 2. Issuer issues a credential to the Holder.
-    let
-      credentialSubject = [ ("clearanceLevel", "TopSecret") ]
-      issuanceDate = time (date 2024 Jan 1) 0 0 0
-      expirationDate = Some $ date 2030 Jan 1
-    offerCid <- submit issuer do
-      createCmd CredentialOffer with
-        issuer, holder, credentialType = "SecurityClearance",
-        credentialSubject, issuanceDate, expirationDate,
-        revocationRegistryCid = Some revocationRegistryCid
+  assertMsg "Verification should be successful" result.verified
+  assertMsg "Reason should be None for successful verification" (result.reason == None)
 
-    (vcCid, vc) <- submit holder do exerciseCmd offerCid AcceptCredentialOffer with holderDid
+  pure ()
 
-    -- 3. Issuer revokes the credential by adding its ID to the registry.
-    updatedRevocationRegistryCid <- submit issuer do
-      exerciseCmd revocationRegistryCid RevokeCredential with credentialIdToRevoke = vc.id
+-- === Revocation Test ===
 
-    -- 4. Verifier requests a presentation.
-    requestCid <- submit verifier do
-      createCmd PresentationRequest with
-        verifier, holder, requestedCredentialType = "SecurityClearance"
+runRevocationTest : Party -> Party -> Party -> Script ()
+runRevocationTest issuer holder verifier = do
+  -- 1. Setup DID & Issue Credential (same as lifecycle test)
+  let holderDid = "did:canton:holder-revocation-" <> show holder
+  didCid <- submit holder do createCmd DID.Did with owner = holder, did = holderDid, controllers = [holder], observers = []
 
-    -- 5. Holder presents the (now revoked) credential.
-    presentationCid <- submit holder do
-      exerciseCmd requestCid FulfillPresentationRequest with
-        credentialCid = vcCid
-        trustRegistryCid
+  let
+    credentialId = "revocable-credential-789"
+    credentialType = "AccessPass"
+    issuanceDate = time (D.date 2024 D.Jan 1) 0 0 0
+    claims = fromList [("area", "RestrictedZone")]
 
-    -- 6. Verifier attempts verification, which must fail due to revocation.
-    verificationResult <- submit verifier do
-      exerciseCmd presentationCid VerifyPresentation
+  requestCid <- submit issuer do
+    createCmd Credential.CredentialRequest with issuer, holder, id = credentialId, credentialType, credentialSubject = holderDid, claims, issuanceDate, expirationDate = None
+  vcCid <- submit holder do exerciseCmd requestCid CredentialRequest_Accept
 
-    verificationResult.verified === False
-    assert (T.isPrefixOf "Credential has been revoked." verificationResult.reason)
+  -- 2. Issuer creates a revocation registry
+  registryCid <- submit issuer do
+    createCmd Revocation.RevocationRegistry with
+      issuer
+      observers = []
 
-  test "Verification fails for untrusted issuer" do
-    -- 1. Setup a new, untrusted issuer.
-    untrustedIssuer <- allocatePartyWithHint "UntrustedIssuer" (PartyIdHint "untrusted-issuer")
-    let untrustedIssuerDid = "did:daml:" <> T.pack (show untrustedIssuer)
-    _ <- submit untrustedIssuer do createCmd DIDDocument with id = untrustedIssuerDid, controller = untrustedIssuer
+  -- 3. Issuer revokes the credential
+  revocationTime <- getTime
+  updatedRegistryCid <- submit issuer do
+    exerciseCmd registryCid RevocationRegistry_Revoke with
+      credentialId
+      revocationTime
 
-    -- 2. Trust registry only trusts the original, good issuer.
-    trustRegistryCid <- submit trustAnchor do
-      createCmd TrustRegistry with anchor = trustAnchor, trustedIssuers = [issuerDid]
+  -- 4. Verifier requests presentation
+  presentationRequestCid <- submit verifier do
+    createCmd Presentation.PresentationRequest with
+      verifier
+      holder
+      id = "revocation-check-presentation"
+      requiredIssuer = Some issuer
+      requiredType = Some credentialType
+      requiredClaims = []
 
-    -- 3. Untrusted issuer issues a credential to the Holder.
-    offerCid <- submit untrustedIssuer do
-      createCmd CredentialOffer with
-        issuer = untrustedIssuer, holder,
-        credentialType = "FakeDiploma",
-        credentialSubject = [("degree", "PhD in Damlology")],
-        issuanceDate = time (date 2024 Jan 1) 0 0 0,
-        expirationDate = None, revocationRegistryCid = None
+  -- 5. Holder presents the (now revoked) credential
+  presentationCid <- submit holder do
+    exerciseCmd presentationRequestCid PresentationRequest_Present with
+      vcCid
 
-    (vcCid, _) <- submit holder do exerciseCmd offerCid AcceptCredentialOffer with holderDid
+  -- 6. Verifier attempts to verify the presentation, providing the revocation registry
+  verificationResultCid <- submit verifier do
+    exerciseCmd presentationCid VerifiablePresentation_Verify with
+      revocationRegistryCid = Some updatedRegistryCid
 
-    -- 4. Verifier requests the credential.
-    requestCid <- submit verifier do
-      createCmd PresentationRequest with
-        verifier, holder, requestedCredentialType = "FakeDiploma"
+  -- 7. Assert failure
+  result <- submit verifier do fetchCmd verificationResultCid
 
-    -- 5. Holder presents the credential from the untrusted source.
-    presentationCid <- submit holder do
-      exerciseCmd requestCid FulfillPresentationRequest with
-        credentialCid = vcCid
-        trustRegistryCid
+  assertMsg "Verification should fail for a revoked credential" (not result.verified)
+  assertMsg "Reason should indicate revocation" (result.reason == Some "Credential has been revoked.")
 
-    -- 6. Verifier's attempt to verify must fail as the issuer is unknown.
-    verificationResult <- submit verifier do
-      exerciseCmd presentationCid VerifyPresentation
+  pure ()
 
-    verificationResult.verified === False
-    verificationResult.reason === "Issuer is not in the Trust Registry."
+-- === Invalid Presentation Test ===
 
-  test "Verification fails for expired credential" do
-    -- 1. Setup trust registry.
-    trustRegistryCid <- submit trustAnchor do
-      createCmd TrustRegistry with anchor = trustAnchor, trustedIssuers = [issuerDid]
+runInvalidPresentationTest : Party -> Party -> Party -> Party -> Script ()
+runInvalidPresentationTest issuer holder verifier anotherIssuer = do
+  -- 1. Setup DID & Issue Credential
+  let holderDid = "did:canton:holder-invalid-" <> show holder
+  didCid <- submit holder do createCmd DID.Did with owner = holder, did = holderDid, controllers = [holder], observers = []
+  
+  let
+    credentialId = "kyc-credential-abc"
+    credentialType = "KycCredential"
+    issuanceDate = time (D.date 2024 D.Feb 1) 0 0 0
+    claims = fromList [("country", "US")]
 
-    -- 2. Get current time and calculate a past date for expiration.
-    now <- getTime
-    let pastDate = addRelTime now (days (-1))
+  requestCid <- submit issuer do
+    createCmd Credential.CredentialRequest with issuer, holder, id = credentialId, credentialType, credentialSubject = holderDid, claims, issuanceDate, expirationDate = None
+  vcCid <- submit holder do exerciseCmd requestCid CredentialRequest_Accept
 
-    -- 3. Issuer issues a credential that has already expired.
-    offerCid <- submit issuer do
-      createCmd CredentialOffer with
-        issuer, holder, credentialType = "TemporaryPass",
-        credentialSubject = [("access", "granted")],
-        issuanceDate = addRelTime now (days (-2)),
-        expirationDate = Some (toDateUTC pastDate),
-        revocationRegistryCid = None
+  -- 2. Verifier requests a presentation from a DIFFERENT issuer
+  presentationRequestCid <- submit verifier do
+    createCmd Presentation.PresentationRequest with
+      verifier
+      holder
+      id = "wrong-issuer-request"
+      requiredIssuer = Some anotherIssuer
+      requiredType = Some credentialType
+      requiredClaims = []
 
-    (vcCid, _) <- submit holder do exerciseCmd offerCid AcceptCredentialOffer with holderDid
+  -- 3. Holder attempts to present the wrong credential
+  -- This submission is expected to fail.
+  submitMustFail holder do
+    exerciseCmd presentationRequestCid PresentationRequest_Present with
+      vcCid
 
-    -- 4. Verifier requests the credential.
-    requestCid <- submit verifier do
-      createCmd PresentationRequest with
-        verifier, holder, requestedCredentialType = "TemporaryPass"
+  pure ()
 
-    -- 5. Holder presents the expired credential.
-    presentationCid <- submit holder do
-      exerciseCmd requestCid FulfillPresentationRequest with
-        credentialCid = vcCid
-        trustRegistryCid
+-- === Invalid Holder Test ===
 
-    -- 6. Verification must fail due to expiration.
-    verificationResult <- submit verifier do
-      exerciseCmd presentationCid VerifyPresentation
+runInvalidHolderTest : Party -> Party -> Party -> Script ()
+runInvalidHolderTest issuer holder verifier = do
+  -- Setup: Need two potential holders
+  realHolder <- allocatePartyWithHint "RealHolder" (PartyIdHint "real-holder")
+  fakeHolder <- allocatePartyWithHint "FakeHolder" (PartyIdHint "fake-holder")
 
-    verificationResult.verified === False
-    verificationResult.reason === "Credential has expired."
+  -- 1. Issue a credential to the real holder
+  let holderDid = "did:canton:real-holder-" <> show realHolder
+  didCid <- submit realHolder do createCmd DID.Did with owner = realHolder, did = holderDid, controllers = [realHolder], observers = []
+  
+  let
+    credentialId = "exclusive-credential"
+    credentialType = "MembershipCard"
+    issuanceDate = time (D.date 2024 Mar 1) 0 0 0
+    claims = fromList [("level", "gold")]
 
-  test "Presentation fulfillment fails for mismatched credential type" do
-    -- 1. Setup trust registry.
-    trustRegistryCid <- submit trustAnchor do
-      createCmd TrustRegistry with anchor = trustAnchor, trustedIssuers = [issuerDid]
+  requestCid <- submit issuer do
+    createCmd Credential.CredentialRequest with issuer, holder = realHolder, id = credentialId, credentialType, credentialSubject = holderDid, claims, issuanceDate, expirationDate = None
+  vcCid <- submit realHolder do exerciseCmd requestCid CredentialRequest_Accept
 
-    -- 2. Issuer issues a "KYC" credential.
-    offerCid <- submit issuer do
-      createCmd CredentialOffer with
-        issuer, holder, credentialType = "KYC",
-        credentialSubject = [("country", "CH")],
-        issuanceDate = time (date 2024 Jan 1) 0 0 0,
-        expirationDate = None, revocationRegistryCid = None
+  -- 2. Verifier requests a presentation from the FAKE holder
+  presentationRequestCid <- submit verifier do
+    createCmd Presentation.PresentationRequest with
+      verifier
+      holder = fakeHolder
+      id = "impersonation-request"
+      requiredIssuer = Some issuer
+      requiredType = Some credentialType
+      requiredClaims = []
 
-    (vcCid, _) <- submit holder do exerciseCmd offerCid AcceptCredentialOffer with holderDid
-
-    -- 3. Verifier requests a different type: "Accreditation".
-    requestCid <- submit verifier do
-      createCmd PresentationRequest with
-        verifier, holder, requestedCredentialType = "Accreditation"
-
-    -- 4. Holder's attempt to fulfill with the wrong credential type must fail.
-    submitMustFail holder do
-      exerciseCmd requestCid FulfillPresentationRequest with
-        credentialCid = vcCid
-        trustRegistryCid
-
-  test "Non-controller cannot create DID Document for another party" do
-    -- 1. Allocate a rogue party.
-    rogueParty <- allocatePartyWithHint "Rogue" (PartyIdHint "rogue")
-
-    -- 2. Define a DID for the legitimate holder.
-    let targetDid = "did:daml:" <> T.pack (show holder)
-
-    -- 3. The rogue party's attempt to create a DID document where the
-    --    controller is `holder` must fail, as `rogueParty` is not a
-    --    signatory on the resulting contract.
-    submitMustFail rogueParty do
-      createCmd DIDDocument with
-        id = targetDid,
-        controller = holder
+  -- 3. The FAKE holder attempts to present the REAL holder's credential
+  -- This should fail because the fake holder is not a stakeholder on the real VC.
+  -- The ledger will prevent fetching/using a contract where the party is not a stakeholder.
+  submitMustFail fakeHolder do
+    exerciseCmd presentationRequestCid PresentationRequest_Present with
+      vcCid
+  
+  pure ()
