@@ -1,96 +1,61 @@
 name: CI
-
 on:
   push:
     branches:
       - main
   pull_request:
-    branches:
-      - main
 
 jobs:
-  build-daml:
-    name: Build and Test Daml Contracts
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install DPM
+      - name: Install DPM (Daml Package Manager)
         run: curl https://get.digitalasset.com/install/install.sh | sh
+        shell: bash
 
       - name: Add DPM to PATH
         run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+        shell: bash
 
-      - name: Display DPM version
+      - name: Verify DPM installation
         run: dpm --version
 
-      # This assumes a multi-package.yaml at the root of the project.
-      - name: Build all Daml packages
-        run: dpm build --all
+      - name: Build Daml Contracts
+        working-directory: ./daml
+        run: dpm build
 
-      # This will run all Daml Script tests found in the project.
-      - name: Run Daml tests
+      - name: Run Daml Tests
+        working-directory: ./daml
         run: dpm test
 
-      - name: Upload Daml artifact (DAR)
-        uses: actions/upload-artifact@v4
-        with:
-          name: daml-dar
-          # This path assumes the main Daml package is located in the `daml` directory.
-          # The glob pattern handles variable version numbers in the DAR filename.
-          path: daml/.daml/dist/canton-did-credentials-*.dar
-          retention-days: 5
-
-  test-sdk:
-    name: Test TypeScript SDK and W3C Compliance
-    runs-on: ubuntu-latest
-    needs: build-daml
-    defaults:
-      run:
-        working-directory: ./sdk
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '20.x'
           cache: 'npm'
-          cache-dependency-path: 'sdk/package-lock.json'
+          cache-dependency-path: sdk/package-lock.json
 
-      - name: Install DPM
-        # DPM is needed for TypeScript code generation from the DAR file.
-        run: curl https://get.digitalasset.com/install/install.sh | sh
-
-      - name: Add DPM to PATH
-        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
-
-      - name: Download Daml artifact (DAR)
-        uses: actions/download-artifact@v4
-        with:
-          name: daml-dar
-          path: ./sdk/dist # Download DAR into a temporary dir within the SDK workspace
-
-      - name: Generate TypeScript bindings
-        # Use the downloaded DAR for codegen. This ensures the SDK is tested
-        # against the exact same contract code built in the previous job.
-        # The output path must match the SDK's project configuration.
-        run: dpm codegen-alpha-typescript ./dist/*.dar -o ./src/daml/
-        working-directory: ./sdk # Override default to run from SDK root
-
-      - name: Install SDK dependencies
+      - name: Install SDK Dependencies
+        working-directory: ./sdk
         run: npm ci
 
-      - name: Run linter
+      - name: Build SDK
+        working-directory: ./sdk
+        run: npm run build
+
+      - name: Lint SDK
+        working-directory: ./sdk
         run: npm run lint
 
-      - name: Run unit and integration tests
-        run: npm run test
+      - name: Test SDK
+        working-directory: ./sdk
+        run: npm test
 
-      - name: Validate W3C DID/VC Compliance
-        # This step assumes a dedicated script in package.json to run
-        # tests against W3C test suites or specifications.
-        run: npm run test:w3c
+      # This step assumes a script exists in sdk/package.json to validate
+      # against the W3C specifications mentioned in docs/W3C_COMPLIANCE.md
+      - name: Validate W3C Compliance
+        working-directory: ./sdk
+        run: npm run test:w3c-compliance
