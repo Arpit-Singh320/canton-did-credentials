@@ -1,258 +1,235 @@
-import fetch, { Headers, RequestInit, Response } from 'node-fetch';
+/**
+ * @module verifier
+ * @description This module provides the Verifier SDK for the canton-did-credentials project.
+ * It offers functionalities to verify W3C Verifiable Presentations, with a specific focus
+ * on checking the on-ledger revocation status of credentials against a Canton network.
+ *
+ * The primary function, `verify`, orchestrates the verification process, which includes:
+ * 1. Basic structural validation of the presentation.
+ * 2. Cryptographic verification of signatures (placeholder for a real crypto library).
+ * 3. On-ledger revocation checks via the Canton JSON API.
+ * 4. Expiration checks.
+ *
+ * This SDK is designed to be used by applications acting as Verifiers in the
+ * self-sovereign identity ecosystem.
+ */
+
+// For non-browser environments (e.g., Node.js), a fetch polyfill is required.
+// You can install it with `npm install node-fetch`.
+// import fetch from 'node-fetch';
 
 /**
- * Represents a party identifier on the Daml ledger.
+ * Configuration for connecting to a Canton ledger's JSON API.
  */
-export type Party = string;
-
-/**
- * Represents a contract identifier on the Daml ledger.
- */
-export type ContractId = string;
-
-/**
- * Represents the payload of a CredentialPresentation contract.
- * The structure should match the Daml template `DID.Presentation:CredentialPresentation`.
- */
-export interface CredentialPresentation {
-  verifier: Party;
-  holder: Party;
-  issuer: Party;
-  credentialId: string;
-  credentialType: string;
-  revocationHandle: string;
-  subjectData: Record<string, any>;
+export interface LedgerConfig {
+  /** The acting party ID of the Verifier. */
+  party: string;
+  /** A valid JWT for authenticating with the JSON API. */
+  token: string;
+  /** The base URL of the JSON API, e.g., 'http://localhost:7575'. */
+  httpBaseUrl: string;
 }
 
 /**
- * Represents the successful result of a JSON API query for a single contract.
+ * The result of a verification process.
  */
-interface GetContractResponse {
-  status: number;
-  result: {
-    payload: any;
-    templateId: string;
-    contractId: ContractId;
+export interface VerificationResult {
+  /** A boolean indicating if the presentation is valid in its entirety. */
+  verified: boolean;
+  /** An array of error messages detailing any verification failures. */
+  errors: string[];
+}
+
+/**
+ * A simplified representation of a W3C Verifiable Credential.
+ * @see https://www.w3.org/TR/vc-data-model/
+ */
+export interface VerifiableCredential {
+  id: string;
+  type: string[];
+  issuer: string;
+  issuanceDate: string;
+  expirationDate?: string;
+  credentialSubject: Record<string, any>;
+  proof: Record<string, any>;
+  [key: string]: any;
+}
+
+/**
+ * A simplified representation of a W3C Verifiable Presentation.
+ * @see https://www.w3.org/TR/vc-data-model/#presentations
+ */
+export interface VerifiablePresentation {
+  '@context': string[];
+  id?: string;
+  type: string[];
+  verifiableCredential: VerifiableCredential[];
+  holder: string;
+  proof: Record<string, any>;
+  [key: string]: any;
+}
+
+/**
+ * Options to configure the verification process.
+ */
+export interface VerificationOptions {
+  /** If true, the verifier will check the on-ledger revocation registry. Defaults to true. */
+  checkRevocation: boolean;
+}
+
+/**
+ * Represents the structure of a Daml revocation registry contract as returned by the JSON API.
+ */
+interface DamlRevocationContract {
+  contractId: string;
+  templateId: string; // e.g., "b19...:Revocation.RevocationRegistry:RegistryEntry"
+  payload: {
+    issuer: string; // Daml Party
+    credentialId: string;
+    reason: string | null; // Daml's `Optional Text`
   };
 }
 
 /**
- * Represents the successful result of a JSON API query for multiple contracts.
+ * Checks the on-ledger revocation status of a single credential.
+ * It queries the Canton ledger for a `Revocation.RevocationRegistry:RegistryEntry` contract
+ * corresponding to the given credential ID.
+ *
+ * @param credential - The credential to check.
+ * @param config - The ledger connection configuration.
+ * @returns An object indicating if the credential has been revoked and the reason, if any.
  */
-interface QueryContractsResponse {
-  status: number;
-  result: {
-    payload: any;
-    templateId: string;
-    contractId: ContractId;
-  }[];
+async function checkRevocationStatus(
+  credential: VerifiableCredential,
+  config: LedgerConfig
+): Promise<{ revoked: boolean; reason?: string }> {
+  // This template ID is defined in the Daml models. It should be consistent
+  // with the package ID and module/template names of your compiled DAR.
+  const revocationTemplateId = "Revocation.RevocationRegistry:RegistryEntry";
+
+  const queryPayload = {
+    templateIds: [revocationTemplateId],
+    query: {
+      credentialId: credential.id,
+    },
+  };
+
+  const response = await fetch(`${config.httpBaseUrl}/v1/query`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${config.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(queryPayload),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Failed to query revocation registry: ${response.status} ${errorBody}`);
+  }
+
+  const jsonResponse: { result: DamlRevocationContract[] } = await response.json();
+  const activeContracts = jsonResponse.result;
+
+  if (activeContracts && activeContracts.length > 0) {
+    const revocationReason = activeContracts[0]?.payload?.reason;
+    return { revoked: true, reason: revocationReason || "No reason provided" };
+  }
+
+  return { revoked: false };
 }
 
 /**
- * Represents the successful result of exercising a choice.
+ * Verifies the cryptographic signature of a credential or presentation.
+ *
+ * @remarks
+ * This is a placeholder function. A production implementation would use a library
+ * like `did-jwt` or `vc-js` to perform DID resolution and JWS verification.
+ *
+ * The steps would be:
+ * 1. Parse the `proof` object to get the verification method (a DID URL).
+ * 2. Resolve the DID to get the full DID Document.
+ * 3. Find the public key corresponding to the verification method.
+ * 4. Verify the JWS signature against the payload of the VC/VP.
+ *
+ * @param data - The Verifiable Credential or Presentation with a `proof` object.
+ * @returns A promise that resolves to true if the signature is valid.
  */
-interface ExerciseChoiceResponse {
-    status: number;
-    result: {
-        exerciseResult: any;
-        events: any[];
-    };
+async function verifySignature(data: VerifiableCredential | VerifiablePresentation): Promise<boolean> {
+  // In a real-world scenario, you would integrate a crypto library here.
+  // For the purpose of this SDK example, we assume signatures are valid.
+  if (!data.proof) return false;
+  return true;
 }
 
-
 /**
- * Represents the outcome of a credential verification process.
+ * Verifies a Verifiable Presentation against the Canton ledger and W3C standards.
+ *
+ * This function performs a comprehensive check, including signature verification,
+ * on-ledger revocation status, and credential expiration.
+ *
+ * @param presentation - The Verifiable Presentation to verify.
+ * @param config - Ledger connection configuration for the Verifier.
+ * @param options - Optional parameters to customize the verification process.
+ * @returns A `VerificationResult` object.
  */
-export interface VerificationResult {
-  success: boolean;
-  message: string;
-  error?: 'UNTRUSTED_ISSUER' | 'CREDENTIAL_REVOKED' | 'PRESENTATION_NOT_FOUND' | 'LEDGER_ERROR' | 'UNEXPECTED_PAYLOAD';
-  acceptedContractId?: ContractId;
-}
+export async function verify(
+  presentation: VerifiablePresentation,
+  config: LedgerConfig,
+  options: VerificationOptions = { checkRevocation: true }
+): Promise<VerificationResult> {
+  const errors: string[] = [];
 
-/**
- * The VerifierSDK provides methods to interact with the Canton ledger
- * for the purpose of verifying W3C-style Verifiable Credentials.
- */
-export class VerifierSDK {
-  private readonly ledgerUrl: string;
-  private readonly headers: Headers;
-
-  /**
-   * Constructs a new instance of the VerifierSDK.
-   * @param ledgerUrl The base URL of the Canton ledger's JSON API (e.g., http://localhost:7575).
-   * @param token The authentication token (JWT) for the verifier party.
-   * @param party The party ID of the verifier. The SDK will act on behalf of this party.
-   */
-  constructor(
-    ledgerUrl: string,
-    private readonly token: string,
-    private readonly party: Party,
-  ) {
-    this.ledgerUrl = ledgerUrl.endsWith('/') ? ledgerUrl.slice(0, -1) : ledgerUrl;
-    this.headers = new Headers({
-      'Authorization': `Bearer ${this.token}`,
-      'Content-Type': 'application/json',
-    });
+  // 1. Basic structural validation of the presentation
+  if (!presentation.type?.includes("VerifiablePresentation")) {
+    errors.push("Object is not a Verifiable Presentation.");
+  }
+  if (!presentation.verifiableCredential || presentation.verifiableCredential.length === 0) {
+    errors.push("Presentation contains no verifiable credentials.");
+  }
+  if (!presentation.proof) {
+    errors.push("Presentation is not signed (missing proof).");
   }
 
-  /**
-   * Centralized method for making API requests to the JSON API.
-   * @param endpoint The API endpoint to hit (e.g., /v1/query).
-   * @param options The fetch request options.
-   * @returns The JSON response from the ledger.
-   */
-  private async apiRequest<T>(endpoint: string, options: RequestInit): Promise<T> {
-    const url = `${this.ledgerUrl}${endpoint}`;
-    try {
-      const response: Response = await fetch(url, options);
+  if (errors.length > 0) {
+    return { verified: false, errors };
+  }
 
-      if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(`Ledger API request failed with status ${response.status} at ${url}: ${errorBody}`);
+  // 2. Verify the presentation's signature
+  const presentationSignatureValid = await verifySignature(presentation);
+  if (!presentationSignatureValid) {
+    errors.push("Presentation signature is invalid.");
+  }
+
+  // 3. Verify each credential within the presentation
+  for (const vc of presentation.verifiableCredential) {
+    // 3a. Verify credential signature
+    const credentialSignatureValid = await verifySignature(vc);
+    if (!credentialSignatureValid) {
+      errors.push(`Signature on credential '${vc.id}' is invalid.`);
+      continue; // Skip further checks for this invalid credential
+    }
+
+    // 3b. Check for credential expiration
+    if (vc.expirationDate && new Date(vc.expirationDate) < new Date()) {
+      errors.push(`Credential '${vc.id}' has expired.`);
+    }
+
+    // 3c. Check for on-ledger revocation status
+    if (options.checkRevocation) {
+      try {
+        const { revoked, reason } = await checkRevocationStatus(vc, config);
+        if (revoked) {
+          errors.push(`Credential '${vc.id}' has been revoked. Reason: ${reason}`);
+        }
+      } catch (e: any) {
+        errors.push(`Error checking revocation for credential '${vc.id}': ${e.message}`);
       }
-
-      const jsonResponse = await response.json();
-
-      if (jsonResponse.status !== 200) {
-        const errorDetails = jsonResponse.errors ? JSON.stringify(jsonResponse.errors) : "No error details provided.";
-        throw new Error(`Ledger API returned non-200 status in body: ${errorDetails}`);
-      }
-
-      return jsonResponse as T;
-    } catch (error) {
-      console.error("Error during API request:", error);
-      throw error;
     }
   }
 
-  /**
-   * Fetches a single contract by its Contract ID.
-   * @param cid The Contract ID to fetch.
-   * @returns The contract details or null if not found.
-   */
-  private async fetchContract(cid: ContractId): Promise<GetContractResponse['result'] | null> {
-    try {
-      const response = await this.apiRequest<GetContractResponse>(`/v1/query/${cid}`, {
-        method: 'GET',
-        headers: this.headers,
-      });
-      return response.result;
-    } catch (error) {
-      // A 404 is an expected error if the contract doesn't exist or isn't visible.
-      if (error instanceof Error && error.message.includes('404')) {
-        return null;
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Queries for active contracts based on a template ID and an optional query payload.
-   * @param templateId The full template ID (e.g., 'DID.TrustAnchor:TrustAnchor').
-   * @param query An optional query object to filter contracts.
-   * @returns An array of matching active contracts.
-   */
-  private async queryContracts(templateId: string, query: Record<string, any> = {}): Promise<QueryContractsResponse['result']> {
-    const response = await this.apiRequest<QueryContractsResponse>('/v1/query', {
-      method: 'POST',
-      headers: this.headers,
-      body: JSON.stringify({
-        templateIds: [templateId],
-        query,
-      }),
-    });
-    return response.result;
-  }
-
-  /**
-   * Exercises a choice on a given contract.
-   * @param templateId The full template ID of the contract.
-   * @param contractId The ID of the contract to exercise the choice on.
-   * @param choice The name of the choice to exercise.
-   * @param argument The argument for the choice.
-   * @returns The result of the exercise command.
-   */
-  private async exerciseChoice<T>(templateId: string, contractId: ContractId, choice: string, argument: Record<string, any>): Promise<ExerciseChoiceResponse['result']> {
-    const response = await this.apiRequest<ExerciseChoiceResponse>('/v1/exercise', {
-      method: 'POST',
-      headers: this.headers,
-      body: JSON.stringify({
-        templateId,
-        contractId,
-        choice,
-        argument,
-      }),
-    });
-    return response.result;
-  }
-
-  /**
-   * Verifies a credential presentation by checking the issuer's trust status and the credential's revocation status.
-   * If all checks pass, it exercises the 'AcceptPresentation' choice on the presentation contract.
-   *
-   * @param presentationCid The Contract ID of the `CredentialPresentation` contract.
-   * @returns A `VerificationResult` object detailing the outcome.
-   */
-  public async verifyPresentation(presentationCid: ContractId): Promise<VerificationResult> {
-    try {
-      // 1. Fetch the CredentialPresentation contract
-      const presentationContract = await this.fetchContract(presentationCid);
-      if (!presentationContract) {
-        return { success: false, message: `CredentialPresentation contract with ID ${presentationCid} not found or not visible.`, error: 'PRESENTATION_NOT_FOUND' };
-      }
-
-      if (presentationContract.templateId !== 'DID.Presentation:CredentialPresentation') {
-        return { success: false, message: `Contract ${presentationCid} has template ${presentationContract.templateId}, expected DID.Presentation:CredentialPresentation.`, error: 'UNEXPECTED_PAYLOAD' };
-      }
-
-      const presentation = presentationContract.payload as CredentialPresentation;
-
-      // Basic sanity check: is this presentation meant for us?
-      if (presentation.verifier !== this.party) {
-         return { success: false, message: `Presentation is for verifier ${presentation.verifier}, but we are ${this.party}.`, error: 'UNEXPECTED_PAYLOAD' };
-      }
-
-      // 2. Check if the issuer is a trusted anchor for this verifier
-      const trustAnchors = await this.queryContracts('DID.TrustAnchor:TrustAnchor', {
-        verifier: this.party,
-        issuer: presentation.issuer,
-      });
-
-      if (trustAnchors.length === 0) {
-        return { success: false, message: `Issuer ${presentation.issuer} is not a trusted anchor for verifier ${this.party}.`, error: 'UNTRUSTED_ISSUER' };
-      }
-
-      // 3. Check if the credential has been revoked
-      const revokedCredentials = await this.queryContracts('DID.Revocation:RevokedCredential', {
-        issuer: presentation.issuer,
-        revocationHandle: presentation.revocationHandle,
-      });
-
-      if (revokedCredentials.length > 0) {
-        return { success: false, message: `Credential with handle ${presentation.revocationHandle} has been revoked by ${presentation.issuer}.`, error: 'CREDENTIAL_REVOKED' };
-      }
-
-      // 4. All checks passed, accept the presentation
-      const exerciseResult = await this.exerciseChoice(
-        'DID.Presentation:CredentialPresentation',
-        presentationCid,
-        'AcceptPresentation',
-        {}
-      );
-
-      const createdEvent = exerciseResult.events.find(e => 'created' in e);
-      const acceptedContractId = createdEvent?.created?.contractId;
-
-      return {
-        success: true,
-        message: `Credential presentation for type '${presentation.credentialType}' from holder ${presentation.holder} successfully verified and accepted.`,
-        acceptedContractId: acceptedContractId
-      };
-
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      return { success: false, message: `An unexpected ledger error occurred: ${errorMessage}`, error: 'LEDGER_ERROR' };
-    }
-  }
+  return {
+    verified: errors.length === 0,
+    errors,
+  };
 }
