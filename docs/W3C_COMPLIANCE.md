@@ -1,77 +1,103 @@
-# W3C Compliance Notes for Canton DID/VC Implementation
+# W3C Compliance Statement for Canton DID and Verifiable Credentials
 
-## 1. Overview
+This document outlines the `canton-did-credentials` project's alignment with, and deviations from, the relevant World Wide Web Consortium (W3C) specifications for Decentralized Identifiers (DIDs) and Verifiable Credentials (VCs). Our goal is to leverage the unique privacy and atomicity features of Canton and Daml while maintaining conceptual interoperability with the broader self-sovereign identity (SSI) ecosystem.
 
-This document outlines how the `canton-did-credentials` project aligns with the core W3C specifications for Decentralized Identifiers (DIDs) and Verifiable Credentials (VCs). Our goal is to provide a W3C-compatible framework that leverages the unique privacy, security, and atomic composability features of the Canton Network and Daml smart contracts.
+## 1. Decentralized Identifiers (DIDs) - Core v1.0
 
-While we aim for semantic compatibility, our implementation makes specific design choices to natively integrate with Canton's distributed ledger model. This means that while the *concepts* align, the *mechanisms* (e.g., proof, revocation) are implemented using Daml's on-ledger capabilities rather than relying on off-ledger JSON-LD documents and cryptographic signatures in the same way as traditional web implementations.
+**Reference:** [W3C DID Core v1.0](https://www.w3.org/TR/did-core/)
 
-## 2. Decentralized Identifiers (DID) Core v1.0
+The Canton Network's native identity primitive, the `Party`, serves as the foundation for our DID implementation.
 
-The DID Core specification describes a new type of globally unique identifier, the architecture for DID Documents, and the process of DID resolution.
+### DID Method: `did:canton`
 
-### DID Method (`did:canton`)
+We propose a conceptual DID method, `did:canton`, where the method-specific identifier is the unique string representation of a Canton `Party`.
 
-This project implicitly defines a new DID method: `did:canton`. A `did:canton` identifier would look something like:
-
-```
-did:canton:<network-id>:<party-id-fingerprint>
-```
-
--   `<network-id>`: An identifier for the specific Canton network (e.g., `mainnet`, `devnet`, or a unique hash for a private consortium network).
--   `<party-id-fingerprint>`: The unique cryptographic fingerprint of a Canton `Party`, derived from its public key, which serves as the unique identifier within that network.
+-   **Format:** `did:canton:<party-id-string>`
+-   **Example:** `did:canton:Issuer::12202f5a...`
 
 ### DID Document
 
-In our model, the **DID Document** is not a static JSON file but is represented by a set of active Daml contracts on the ledger, primarily the `DID.TrustAnchor.TrustAnchor` contract.
+A DID Document for a `did:canton` identifier is not stored as a single public document (like on a public blockchain). Instead, it is dynamically constructed by a DID Resolver that has access to the party's participant node on the Canton network.
 
-The mapping from DID Document properties to the `TrustAnchor` contract is as follows:
+A resolved DID Document would conform to the W3C structure:
 
-| DID Document Property  | Daml Implementation                                                                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`                   | The `did:canton` identifier, derived from the `controller` party field of the `TrustAnchor` contract.                                                                           |
-| `controller`           | The `controller` field (type `Party`) on the `TrustAnchor` contract. This is the signatory of the contract and the only party who can authorize updates.                          |
-| `verificationMethod`   | The Canton participant node associated with the `controller` party holds the key material. The verification key is implicitly the party's public key managed by the Canton protocol. |
-| `authentication`       | Any choice exercised by the `controller` on the `TrustAnchor` or related contracts is implicitly an act of authentication. The Canton protocol guarantees the authenticity of submissions. |
-| `assertionMethod`      | Similar to `authentication`, when the `controller` exercises a choice to present a credential, it is performing an assertion.                                                   |
-| `service`              | Can be modeled as a separate `ServiceEndpoint` contract, keyed by the `TrustAnchor` contract ID, containing endpoint URLs and types.                                            |
+```json
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1",
+    "https://w3id.org/security/suites/ed25519-2020/v1"
+  ],
+  "id": "did:canton:Issuer::12202f5a...",
+  "verificationMethod": [{
+    "id": "did:canton:Issuer::12202f5a...#keys-1",
+    "type": "Ed25519VerificationKey2020",
+    "controller": "did:canton:Issuer::12202f5a...",
+    "publicKeyMultibase": "zH3C2AVvL...L9L1T"
+  }],
+  "authentication": [
+    "did:canton:Issuer::12202f5a...#keys-1"
+  ],
+  "assertionMethod": [
+    "did:canton:Issuer::12202f5a...#keys-1"
+  ]
+}
+```
+
+-   `id`: The Canton Party DID.
+-   `verificationMethod`: The public key associated with the Party, managed by its hosting Canton participant node. The key material is used to sign transactions on the network.
+-   `service`: Service endpoints (e.g., for credential issuance) can be represented by on-ledger Daml contracts that define the protocols for interaction.
 
 ### DID Operations (CRUD)
 
--   **Create (Register)**: A new DID is created when a `TrustAnchor` contract is created on the ledger with the `controller` as the signatory.
--   **Read (Resolve)**: Resolving a `did:canton` identifier involves querying the Canton ledger for the active `TrustAnchor` contract where the `controller` matches the DID. This is performed via the Ledger API by a party who has visibility on the contract.
--   **Update**: The `controller` can update the DID Document by exercising choices on the `TrustAnchor` contract (e.g., to add a new service endpoint or delegate authority). This archives the old contract and creates a new one in a single atomic transaction.
--   **Deactivate (Revoke)**: The `controller` can exercise a `Deactivate` choice on the `TrustAnchor` contract, which archives it permanently without creating a successor. Subsequent resolution attempts will find no active contract, indicating deactivation.
+-   **Create:** A new DID is created when a participant node allocates a new `Party`. This is a native Canton ledger operation.
+-   **Read/Resolve:** Resolution requires querying the Canton network's identity infrastructure or a specific participant node that can attest to the Party's existence and public key.
+-   **Update/Deactivate:** Key rotation is managed at the Canton participant node level. Deactivation is conceptually equivalent to the participant operator decommissioning the `Party` and refusing to sign transactions on its behalf.
 
-## 3. Verifiable Credentials (VC) Data Model v1.1
+## 2. Verifiable Credentials (VCs) - Data Model v1.1
 
-The VC Data Model specifies the structure for credentials. Our on-ledger Daml contracts for VCs mirror this structure.
+**Reference:** [W3C VC Data Model v1.1](https://www.w3.org/TR/vc-data-model/)
 
-### Core Data Model
+Our Daml `VerifiableCredential` template is designed to map directly to the core concepts of the W3C VC Data Model.
 
-A Daml `VerifiableCredential` template semantically maps to the standard VC properties:
+### Data Model Mapping
 
-| VC Data Model Property | Daml Implementation                                                                                                                                                                                                             |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@context`             | Implicitly defined by the Daml template's module and name (`Credential.KYC.KycCredential`). The schema is enforced by the Daml type system.                                                                                       |
-| `id`                   | The `ContractId` of the Daml contract, which is a unique, unforgeable identifier for that specific credential instance.                                                                                                            |
-| `type`                 | The Daml template name (e.g., `VerifiableCredential`, `KycCredential`).                                                                                                                                                           |
-| `issuer`               | The `issuer` field (type `Party`) on the credential contract. The issuer is always a signatory, cryptographically attesting to the issuance.                                                                                     |
-| `issuanceDate`         | A `Time` field on the credential contract, populated at the time of creation.                                                                                                                                                   |
-| `expirationDate`       | An optional `Time` field. Daml's time-based validation can be used to prevent the use of expired credentials.                                                                                                                       |
-| `credentialSubject`    | A nested data type within the Daml template. The `subject` field contains the claims about the holder (e.g., KYC status, jurisdiction). The holder is identified by their `Party` ID.                                            |
-| `proof`                | **This is the most significant design difference.** We do **not** use a separate `proof` block with a digital signature (e.g., JWS). Instead, the proof is **implicit and intrinsic** to the Daml model. The act of creating a VC contract requires the `issuer`'s signature, which is cryptographically enforced by the Canton ledger. The integrity of the ledger *is* the proof. This is a stronger and more integrated form of verification. |
+The Daml template `Main.VerifiableCredential` corresponds to a W3C Verifiable Credential as follows:
 
-### Revocation (Status List 2021)
+| W3C VC Property      | Daml Template Field (`Main.VerifiableCredential`)                      | Notes                                                                                                                                                                             |
+| -------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                 | `(ContractId VerifiableCredential)`                                    | The unique, unforgeable Daml Contract ID (`ContractId`) serves as the credential's unique identifier.                                                                           |
+| `type`               | `credentialType: Text`                                                 | Explicitly defines the credential type, e.g., "KYCCredential", "AccreditedInvestorCredential".                                                                                    |
+| `issuer`             | `issuer: Party`                                                        | The DID of the issuer, e.g., `did:canton:<issuer-party-id>`.                                                                                                                      |
+| `issuanceDate`       | Implicit in transaction time                                           | While not an explicit field, the issuance time is recorded cryptographically as part of the Canton transaction metadata. It can be added as an explicit `Time` field if needed. |
+| `credentialSubject`  | `holder: Party`, `claims: Text`                                        | The `holder` is the subject's DID. The `claims` field holds the subject's attributes, typically as a JSON string to allow for flexible, complex data structures.                 |
+| `proof`              | **Intrinsic to the Canton Transaction**                                | This is the most significant design choice. See section below.                                                                                                                    |
+| `credentialStatus`   | `revocationRegistry: Optional (ContractId RevocationRegistry)`         | A link to an on-ledger registry contract for status checks (see Section 3).                                                                                                       |
 
-Instead of relying on off-ledger status lists, we implement revocation directly on-ledger, which is more secure, real-time, and privacy-preserving.
+### Proof and Verification
 
--   **Mechanism**: A `RevocationRegistry` contract is controlled by the issuer. When a credential needs to be revoked, the issuer exercises a `Revoke` choice, which adds the credential's `ContractId` to a revoked list within the registry contract.
--   **Verification**: During verification, the verifier's workflow includes a step to query the issuer's `RevocationRegistry` to ensure the presented credential is not listed as revoked. Because this is an on-ledger query, it can be part of the same atomic transaction as the rest of the verification logic, preventing race conditions.
+Instead of a separate `proof` block (e.g., `Ed25519Signature2020`), the authenticity and integrity of a credential are guaranteed by the Canton transaction that created it.
 
-## 4. Summary of Differences and Advantages
+-   **Authenticity:** The transaction creating the `VerifiableCredential` contract is digitally signed by the `issuer` party. This signature is cryptographically verified by the Canton protocol.
+-   **Integrity:** The resulting Daml contract is immutable. Any attempt to change it would result in a new transaction, breaking the link to the original issuer's signature.
+-   **Verification:** A verifier, when presented with a credential, verifies it by confirming its existence on the ledger. Because of Canton's privacy model, the holder must explicitly disclose the contract to the verifier. The verifier's node will then confirm that the contract is active and that its signatories (the `issuer`) are authentic. This process provides a higher level of assurance than verifying a signature on a detached JSON object.
 
-1.  **On-Ledger State**: VCs are active Daml contracts, not static JSON objects. This allows for native, real-time state management (e.g., revocation) and atomic composition with other on-ledger assets and workflows (e.g., Delivery vs. Payment).
-2.  **Implicit Proof**: The Canton protocol's cryptographic guarantees of transaction authenticity and integrity replace the need for an explicit `proof` block. The issuer's signatory rights on the contract provide a stronger, non-repudiable proof of issuance than a separable signature.
-3.  **Enhanced Privacy**: Canton's privacy model ensures that a VC is only visible to its stakeholders (issuer, holder, and any explicitly disclosed verifiers). This prevents the data leakage common on public blockchains and aligns with data privacy regulations like GDPR.
-4.  **Type Safety**: The Daml type system enforces the credential schema at compile time, eliminating an entire class of errors related to malformed data that can occur with flexible JSON-LD contexts.
+## 3. Credential Status and Revocation
+
+We implement revocation using an on-ledger `RevocationRegistry` contract, which is conceptually similar to the `StatusList2021` W3C specification.
+
+-   The `issuer` controls a `RevocationRegistry` contract.
+-   To revoke a credential, the `issuer` exercises a choice on the registry contract to add the `ContractId` of the revoked credential to a list.
+-   Verifiers must be given visibility on both the `VerifiableCredential` contract and the associated `RevocationRegistry` contract.
+-   During verification, the verifier checks that the credential's ID is **not** present in the revocation list.
+-   This check can be performed atomically within the same Daml transaction as the verification logic, preventing race conditions where a credential is used after it has been revoked.
+
+## 4. Summary of Deviations and Benefits
+
+This project deliberately deviates from a literal interpretation of W3C standards to leverage the superior privacy, security, and atomicity guarantees of the Canton Network.
+
+-   **Deviation: Intrinsic Proof.** We do not use a separable JSON-LD proof block. The proof is the Canton transaction itself.
+    -   **Benefit:** Prevents replay attacks and provides stronger proof of provenance. Verification is not just a signature check but a confirmation of the credential's current, active state on a mutually trusted ledger.
+-   **Deviation: Privacy-by-Default.** VCs are not public. They are private contracts visible only to the stakeholders (`issuer`, `holder`, and any observers). Disclosure to a `verifier` is an explicit, auditable action controlled by the holder.
+    -   **Benefit:** Superior privacy and compliance with data protection regulations like GDPR. There is no public broadcasting of personal information.
+-   **Deviation: DID Resolution.** DIDs are resolved via Canton's identity layer, not a global public registry.
+    -   **Benefit:** Aligns with enterprise use cases where identity is managed within a consortium or federated ecosystem rather than a fully open, anonymous network.
